@@ -43,7 +43,7 @@ commerce_agent/
 ├── state.py                     # AgentState TypedDict
 ├── nodes/
 │   ├── intent.py                # classify_intent
-│   ├── freshness.py             # check_freshness
+│   ├── loaded.py                # check_loaded
 │   ├── sql.py                   # run_sql
 │   ├── ingestion.py             # run_ingestion (IngestionPipeline 실행)
 │   └── responder.py             # generate_response
@@ -266,7 +266,7 @@ class UpsertFilter(Filter):
 def make_run_ingestion(pipeline: Pipeline):
     async def run_ingestion(state: AgentState) -> AgentState:
         # query에서 카테고리 추출 후 파이프라인 실행
-        category = extract_category(state["query"])  # 또는 state["intent_detail"]
+        category = state["query"]  # Phase 1: 질의를 카테고리로 직접 사용 (이어폰 단일 카테고리)
         products = await pipeline.run(category)
         return {**state, "products": [p.model_dump() for p in products]}
     return run_ingestion
@@ -279,7 +279,7 @@ def make_run_ingestion(pipeline: Pipeline):
 
 ```python
 async def check_loaded(state: AgentState) -> AgentState:
-    category = extract_category(state["query"])
+    category = "headphones"  # Phase 1: 이어폰 단일 카테고리 고정
     count = await session.scalar(
         select(func.count()).where(normalized_products.c.category == category)
     )
@@ -463,7 +463,7 @@ async def run_sql(state: AgentState) -> AgentState:
 | Ollama (POC) | `llama3.1:8b` | `sqlcoder:7b` |
 | HuggingFace (Phase 2+) | `meta-llama/Llama-3.1-8B-Instruct` | `defog/sqlcoder-7b-2` |
 
-### `normalize` (`nodes/normalizer.py`)
+### `NormalizedProduct` 스키마 (`schemas.py`)
 
 ```python
 class NormalizedProduct(BaseModel):
@@ -512,7 +512,7 @@ POST /refresh/{id}
           ├─────────────────┤
           │  계약 테스트     │  LLM 노드 — 출력 구조 검증
           ├─────────────────┤
-          │  단위 테스트     │  Filter, freshness, 라우팅 — TDD
+          │  단위 테스트     │  Filter, check_loaded, 라우팅 — TDD
           └─────────────────┘
 ```
 
@@ -565,16 +565,16 @@ async def test_check_loaded_when_empty():
 
 ```python
 # tests/test_routing.py
-from graph import route_by_intent, route_by_freshness
+from graph import route_by_intent, route_by_loaded
 
 def test_route_structured():
     assert route_by_intent({"intent": "structured"}) == "structured"
 
-def test_route_fresh():
-    assert route_by_freshness({"is_fresh": True}) == "fresh"
+def test_route_loaded():
+    assert route_by_loaded({"is_loaded": True}) == "loaded"
 
-def test_route_stale():
-    assert route_by_freshness({"is_fresh": False}) == "stale"
+def test_route_not_loaded():
+    assert route_by_loaded({"is_loaded": False}) == "not_loaded"
 ```
 
 ### 계약 테스트 — LLM 노드
@@ -1049,7 +1049,7 @@ commerce_agent/
 │   ├── state.py                      # AgentState TypedDict
 │   └── nodes/
 │       ├── intent.py                 # classify_intent
-│       ├── freshness.py              # check_freshness
+│       ├── loaded.py                 # check_loaded
 │       ├── sql.py                    # run_sql
 │       ├── search.py                 # web_search
 │       ├── crawler.py                # crawl
@@ -1130,7 +1130,7 @@ DB Layer           SQLAlchemy models + crud
 ### 디자인 패턴
 
 **Strategy**
-`classify_intent` 노드가 intent에 따라 실행 전략을 선택한다. `structured`, `freshness`, `interpret` 세 전략은 같은 인터페이스(`AgentState → AgentState`)를 공유하지만 내부 경로가 다르다.
+`classify_intent` 노드가 intent에 따라 실행 전략을 선택한다. `structured`, `interpret` 두 전략은 같은 인터페이스(`AgentState → AgentState`)를 공유하지만 내부 경로가 다르다.
 
 **Repository**
 `IProductRepository` 인터페이스를 Domain Layer에 정의하고 구현체를 Infrastructure Layer에 둔다. Application Layer(노드)는 인터페이스에만 의존하므로 DB 교체 시 노드 코드를 건드리지 않아도 된다.
