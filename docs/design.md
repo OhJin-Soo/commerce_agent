@@ -2,9 +2,9 @@
 
 ## 개요
 
-외부 웹 데이터를 내부 커머스 DB로 축적하는 에이전트.
-사용자가 질문하면 로컬 DB를 먼저 조회하고, 데이터가 없거나 낡았으면 웹검색 → 파싱 → DB 저장 후 응답한다.
-시간이 지날수록 DB에 데이터가 쌓여 웹검색 의존도가 낮아지는 구조.
+Kaggle 공개 데이터셋을 내부 커머스 DB로 축적하는 에이전트.
+사용자가 질문하면 로컬 DB를 먼저 조회하고, 해당 카테고리가 미적재 상태이면 Kaggle CSV → 파싱 → DB 저장 후 응답한다.
+시간이 지날수록 DB에 데이터가 쌓여 재적재 빈도가 낮아지는 구조.
 
 에이전트 워크플로우는 **LangGraph** `StateGraph`로 구현한다.
 
@@ -28,7 +28,7 @@ Clean Architecture 4계층 + DDD + 3개 Bounded Context. 설계 문서의 DDD �
 - Pydantic 스키마 (`NormalizedProduct`)
 
 **Phase 2 이후로 미루는 것:**
-- `IProductRepository` / `ILLMPort` 인터페이스
+- `IProductRepository` 인터페이스
 - DDD Aggregate / Value Object / Domain Event
 - Bounded Context 분리 + ACL
 - source_provenance 테이블
@@ -94,6 +94,7 @@ from langgraph.graph.message import add_messages
 class AgentState(TypedDict):
     query:        str
     intent:       str | None          # "structured" | "interpret"
+    category:     str | None          # 정규화된 Kaggle 카테고리명 (classify_intent가 채움)
     is_loaded:    bool | None         # 해당 카테고리 데이터가 DB에 적재되어 있는가
     products:     list[dict]          # 적재된 상품 목록 (ingestion 후 채워짐)
     sql_query:    str | None          # 생성된 SQL
@@ -179,7 +180,7 @@ def build_graph(dataset_path: str, session) -> StateGraph:
 ## 수집 파이프라인 — Pipe-Filter
 
 데이터 소스로 **Amazon Products Sales Dataset 2023** (Kaggle 공개 데이터)을 사용한다.
-웹 크롤링 없이 로컬 CSV를 읽어 DB에 적재하므로 Tavily, httpx, Playwright 의존이 불필요하다.
+로컬 CSV를 읽어 DB에 적재한다.
 
 ```python
 import kagglehub
@@ -265,8 +266,7 @@ class UpsertFilter(Filter):
 ```python
 def make_run_ingestion(pipeline: Pipeline):
     async def run_ingestion(state: AgentState) -> AgentState:
-        # query에서 카테고리 추출 후 파이프라인 실행
-        category = state["query"]  # Phase 1: 질의를 카테고리로 직접 사용 (이어폰 단일 카테고리)
+        category = state["category"]   # classify_intent가 채운 Kaggle 카테고리명
         products = await pipeline.run(category)
         return {**state, "products": [p.model_dump() for p in products]}
     return run_ingestion
@@ -278,12 +278,16 @@ def make_run_ingestion(pipeline: Pipeline):
 **해당 카테고리 데이터가 DB에 적재되어 있는지** 여부만 판단한다.
 
 ```python
-async def check_loaded(state: AgentState) -> AgentState:
-    category = "headphones"  # Phase 1: 이어폰 단일 카테고리 고정
-    count = await session.scalar(
-        select(func.count()).where(normalized_products.c.category == category)
-    )
-    return {**state, "is_loaded": count > 0}
+def make_check_loaded(session):
+    async def check_loaded(state: AgentState) -> AgentState:
+        category = state["category"]
+        if not category:
+            return {**state, "is_loaded": False}
+        count = await session.scalar(
+            select(func.count()).where(normalized_products.c.category == category)
+        )
+        return {**state, "is_loaded": count > 0}
+    return check_loaded
 ```
 
 - `is_loaded = True` → 이미 적재됨, 바로 SQL 실행
@@ -310,13 +314,13 @@ async def check_loaded(state: AgentState) -> AgentState:
 CREATE TABLE normalized_products (
     id                BIGSERIAL PRIMARY KEY,
     source_site       TEXT NOT NULL,
-    source_product_id TEXT,
+    source_product_id TEXT,               -- 데이터소스 고유 ID (Kaggle CSV는 없으므로 NULL 허용)
     source_url        TEXT NOT NULL,
     name              TEXT NOT NULL,
     brand             TEXT,
     category          TEXT,
     price             NUMERIC(12, 0),
-    currency          TEXT DEFAULT 'KRW',
+    currency          TEXT DEFAULT 'INR',   -- Amazon Kaggle 데이터셋 기준 (인도 루피)
     rating            NUMERIC(3, 2),
     review_count      INT,
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -368,18 +372,52 @@ CREATE TABLE source_provenance (
 
 ### `classify_intent` (`nodes/intent.py`)
 
+intent 분류와 카테고리 추출을 **한 번의 LLM 호출**로 처리한다.
+
 ```python
-async def classify_intent(state: AgentState) -> AgentState:
-    # LLM structured output으로 QueryIntent 반환
-    # state["intent"] 업데이트
+from pydantic import BaseModel
+from typing import Literal
+
+# 지원 카테고리 → Kaggle CSV main_category 값 매핑
+CATEGORY_MAP: dict[str, str] = {
+    "headphones": "headphones",   # Phase 1 지원 카테고리
+    # Phase 2+: 추가 Kaggle 데이터셋 카테고리 추가
+}
+
+class QueryClassification(BaseModel):
+    intent:   Literal["structured", "interpret"]
+    category: str   # CATEGORY_MAP 키 중 하나, 해당 없으면 "unknown"
+
+CLASSIFY_PROMPT = """
+사용자 질의를 분석하여 아래 두 가지를 반환하라.
+
+intent:
+- structured : 필터·정렬 조건이 명확한 상품 검색 ("5만원 이하 이어폰", "평점 높은 순")
+- interpret  : 추천·비교·설명 요청 ("가성비 좋은 이어폰 추천", "이 둘 차이가 뭐야?")
+
+category: 질의와 관련된 상품 카테고리 (headphones / unknown)
+"""
+
+def make_classify_intent(llm):
+    structured_llm = llm.with_structured_output(QueryClassification)
+
+    async def classify_intent(state: AgentState) -> AgentState:
+        result = await structured_llm.ainvoke([
+            {"role": "system", "content": CLASSIFY_PROMPT},
+            {"role": "user",   "content": state["query"]},
+        ])
+        kaggle_category = CATEGORY_MAP.get(result.category)
+        return {**state, "intent": result.intent, "category": kaggle_category}
+
+    return classify_intent
 ```
 
 | intent | 예시 |
 |---|---|
-| `structured` | "5만원 이하 이어폰", "나이키 평점 높은 순" |
-| `interpret` | "가성비 좋은 러닝화 추천", "이 둘 차이가 뭐야?" |
+| `structured` | "5만원 이하 이어폰", "평점 높은 순 이어폰" |
+| `interpret` | "가성비 좋은 이어폰 추천", "이 둘 차이가 뭐야?" |
 
-> 데이터 소스가 Kaggle 정적 CSV이므로 실시간 재고/가격 조회(`freshness` intent)는 지원하지 않는다.
+> 데이터 소스가 Kaggle 정적 CSV이므로 실시간 재고/가격 조회는 지원하지 않는다.
 
 ### `run_sql` (`nodes/sql.py`) — 3단계 점진적 전략
 
@@ -396,10 +434,38 @@ Stage 3 (전문화)  범용 LLM은 의도 해석만, SQLCoder가 SQL 생성
 #### Stage 1 — 직접 생성 (POC)
 
 ```python
-async def run_sql(state: AgentState) -> AgentState:
-    # 시스템 프롬프트에 DB 스키마 포함
-    # LLM이 SELECT 문 생성
-    # SELECT-only 검증 후 실행
+from sqlalchemy import text
+import sqlparse
+
+SCHEMA_PROMPT = """
+다음 PostgreSQL 스키마를 기반으로 SELECT 문만 작성하라. 다른 DML/DDL은 절대 사용하지 말 것.
+
+테이블: normalized_products
+  컬럼: id, source_site, source_url, name, brand, category, price, currency, rating, review_count
+
+테이블: product_facts
+  컬럼: id, product_id, attribute_name, attribute_value
+
+SQL 문만 출력하고 설명은 붙이지 말 것.
+"""
+
+def make_run_sql(llm, session):
+    async def run_sql(state: AgentState) -> AgentState:
+        result = await llm.ainvoke([
+            {"role": "system", "content": SCHEMA_PROMPT},
+            {"role": "user",   "content": state["query"]},
+        ])
+        sql = result.content.strip()
+
+        # SELECT-only 검증
+        parsed = sqlparse.parse(sql)
+        if not parsed or parsed[0].get_type() != "SELECT":
+            return {**state, "sql_results": [], "sql_error": "non-SELECT statement blocked"}
+
+        rows = await session.execute(text(sql))
+        return {**state, "sql_query": sql, "sql_results": [dict(r._mapping) for r in rows]}
+
+    return run_sql
 ```
 
 #### SQL 품질 지표 측정
@@ -473,7 +539,7 @@ class NormalizedProduct(BaseModel):
     brand:         str | None
     category:      str | None
     price:         int | None
-    currency:      str = "INR"   # Amazon Kaggle 데이터셋 기준
+    currency:      str = "INR"   # Amazon Kaggle 데이터셋 기준 (인도 루피)
     rating:        float | None
     review_count:  int | None
     facts:         dict[str, str] = {}
@@ -486,19 +552,20 @@ class NormalizedProduct(BaseModel):
 ## API 엔드포인트
 
 ```
+# Phase 1
 POST /query
     body: { "query": "5만원 이하 무선 이어폰 추천해줘" }
     → commerce_graph.ainvoke({"query": ..., "messages": [...]})
 
+# Phase 2
 GET /products
     query params: category, brand, max_price, min_rating, sort_by
 
 GET /products/{id}
     → 상품 상세 + product_facts
-
-POST /refresh/{id}
-    → is_fresh=False로 강제 설정 후 그래프 재실행
 ```
+
+> `POST /refresh/{id}` (강제 재적재)는 Phase 3 이후 검토. Kaggle 정적 CSV 환경에서는 TTL/freshness 개념이 없으므로 불필요하다.
 
 ---
 
@@ -848,7 +915,7 @@ uv run pytest -m eval                             # 프롬프트 변경 후 수�
 - [ ] `IProductRepository` 인터페이스 도입 + 노드 팩토리에 주입
 - [ ] `interface/`, `application/`, `domain/`, `infrastructure/` 레이어 분리
 - [ ] LangGraph `MemorySaver` — 멀티턴 대화 상태 유지
-- [ ] 커버리지 확대 (무신사, 올리브영)
+- [ ] 커버리지 확대 (추가 Kaggle 데이터셋, 카테고리 확장)
 - [ ] `GET /products`, `POST /refresh/{id}` 엔드포인트
 
 ### Phase 3 — 품질 개선
@@ -863,12 +930,15 @@ uv run pytest -m eval                             # 프롬프트 변경 후 수�
 
 ## DDD (도메인 주도 설계)
 
+> **이 섹션은 Phase 3 목표 아키텍처의 레퍼런스다.** Phase 1·2에서는 구현하지 않는다.
+> 실제 구현 범위는 "구현 순서 (Phase)" 섹션의 체크리스트를 따른다.
+
 ### 서브도메인 분류
 
 | 서브도메인 | 유형 | 설명 |
 |---|---|---|
 | **Product Catalog** | Core Domain | 상품 정보를 구조화·축적하는 핵심 차별화 영역 |
-| **Ingestion** | Supporting Domain | 웹 수집 → 정규화 → DB 적재 파이프라인 |
+| **Ingestion** | Supporting Domain | Kaggle CSV 수집 → 정규화 → DB 적재 파이프라인 |
 | **Query** | Supporting Domain | 질의 분류, SQL 생성, 응답 생성 |
 | **Provenance** | Generic Domain | 출처 추적, 신뢰도 관리 |
 
@@ -882,10 +952,10 @@ uv run pytest -m eval                             # 프롬프트 변경 후 수�
 │                         │   │                          │
 │  Aggregate: Product     │◄──│  Domain Svc:             │
 │  - ProductFact (VO)     │   │    NormalizationService  │
-│  - Price (VO)           │   │  Aggregate: SearchResult │
-│  - Rating (VO)          │   │  - SourceUrl (VO)        │
-│  Repo: IProductRepo     │   │  - Confidence (VO)       │
-│  Event: ProductUpserted │   │  Repo: ISearchResultRepo │
+│  - Price (VO)           │   │  (Kaggle CSV → Product)  │
+│  - Rating (VO)          │   │                          │
+│  Repo: IProductRepo     │   │                          │
+│  Event: ProductUpserted │   │                          │
 └─────────────────────────┘   └─────────────────────────┘
            ▲                              ▲
            │         Anti-Corruption Layer│
@@ -919,7 +989,7 @@ Context Map 관계:
 │          Domain Layer            │  Aggregate, Entity, VO, Domain Service,
 │                                  │  Repository 인터페이스, Domain Event
 ├──────────────────────────────────┤
-│       Infrastructure Layer       │  SQLAlchemy, Tavily, httpx, Anthropic SDK
+│       Infrastructure Layer       │  SQLAlchemy, kagglehub, asyncpg
 └──────────────────────────────────┘
 ```
 
@@ -999,30 +1069,13 @@ class ProductUpserted:
     occurred_at: datetime
 ```
 
-#### SearchResult Aggregate (`domain/ingestion/`)
-
-```python
-# entity.py
-@dataclass
-class SearchResult:                   # Aggregate Root
-    id:         SearchResultId
-    query:      str
-    title:      str | None
-    snippet:    str | None
-    url:        str
-    source:     str
-    raw_text:   str | None
-    fetched_at: datetime
-```
-
 #### Domain Services
 
 ```python
 # domain/ingestion/services.py
 class NormalizationService:
-    """비정형 웹 텍스트 → Product 도메인 모델 변환. LLM 호출은 포트(인터페이스)로 분리."""
-    def __init__(self, llm_port: ILLMPort): ...
-    async def normalize(self, result: SearchResult) -> Product: ...
+    """Kaggle CSV 행 → Product 도메인 모델 변환. 규칙 기반 파싱."""
+    async def normalize(self, rows: list[dict]) -> list[Product]: ...
 
 # domain/product/services.py
 class FreshnessService:
@@ -1051,8 +1104,6 @@ commerce_agent/
 │       ├── intent.py                 # classify_intent
 │       ├── loaded.py                 # check_loaded
 │       ├── sql.py                    # run_sql
-│       ├── search.py                 # web_search
-│       ├── crawler.py                # crawl
 │       ├── normalizer.py             # normalize (NormalizationService 호출)
 │       ├── db_writer.py              # upsert_db (IProductRepository 호출)
 │       └── responder.py              # generate_response
@@ -1065,9 +1116,6 @@ commerce_agent/
 │   │   ├── events.py                 # ProductUpserted
 │   │   └── services.py               # FreshnessService, TTLPolicy
 │   └── ingestion/
-│       ├── entity.py                 # SearchResult aggregate
-│       ├── value_objects.py          # Confidence, SourceUrl
-│       ├── repository.py             # ISearchResultRepository (인터페이스)
 │       └── services.py               # NormalizationService
 │
 └── infrastructure/                   # Infrastructure Layer
@@ -1075,15 +1123,9 @@ commerce_agent/
     │   ├── models.py                 # SQLAlchemy ORM 모델
     │   ├── session.py                # DB 세션
     │   └── repositories/
-    │       ├── product_repo.py       # IProductRepository 구현체
-    │       └── search_repo.py        # ISearchResultRepository 구현체
-    ├── search/
-    │   └── tavily_client.py          # Tavily API 클라이언트
-    ├── crawler/
-    │   └── httpx_crawler.py          # httpx + BeautifulSoup4
+    │       └── product_repo.py       # IProductRepository 구현체
     └── llm/
-        ├── anthropic_client.py       # Anthropic SDK 래퍼
-        └── ports.py                  # ILLMPort 인터페이스
+        └── langchain_client.py       # LangChain 클라이언트 (Phase 1: ChatOllama, Phase 2+: ChatOpenAI)
 ```
 
 ---
@@ -1104,7 +1146,7 @@ read(query) → DB hit? → return
 **CQRS (Command Query Responsibility Segregation)**
 읽기와 쓰기 경로를 분리한다.
 - **Query 경로**: `run_sql` 노드 → `normalized_products` 조회 (SQL Agent)
-- **Command 경로**: `web_search → crawl → normalize → upsert_db` (수집 파이프라인)
+- **Command 경로**: `kaggle_load → normalize → upsert_db` (수집 파이프라인)
 
 두 경로가 동일 모델을 공유하되 코드 흐름은 완전히 분리되어 있다.
 
@@ -1113,7 +1155,7 @@ read(query) → DB hit? → return
 
 | 단계 | 노드 | 역할 |
 |---|---|---|
-| Extract | `web_search` + `crawl` | 원천 데이터 수집 |
+| Extract | `kaggle_load` | Kaggle CSV 로드 |
 | Transform | `normalize` | 비정형 → `NormalizedProduct` 구조화 |
 | Load | `upsert_db` | DB 적재 |
 
@@ -1121,7 +1163,7 @@ read(query) → DB hit? → return
 ```
 API Layer          FastAPI 엔드포인트
 Agent Layer        LangGraph StateGraph (intent → routing → 실행)
-Service Layer      각 노드 함수 (search, crawl, normalize, sql)
+Service Layer      각 노드 함수 (ingestion, normalize, sql)
 DB Layer           SQLAlchemy models + crud
 ```
 
@@ -1142,7 +1184,7 @@ DB Layer           SQLAlchemy models + crud
 FastAPI의 `POST /query` 엔드포인트가 Facade. 클라이언트는 LangGraph 그래프 내부 노드 구성이나 DB 구조를 몰라도 된다. `commerce_graph.ainvoke()` 한 번으로 전체 파이프라인이 실행된다.
 
 **Strangler Fig (점진적 교체)**
-Phase 1에서는 단일 카테고리(이어폰)로 파이프라인을 검증하고, Phase 3에서 커버리지를 확대한다. 초기에는 웹검색 의존도가 높다가 DB가 채워질수록 검색 비율이 줄어드는 구조 자체가 Strangler Fig와 같은 점진적 전환이다.
+Phase 1에서는 단일 카테고리(이어폰)로 파이프라인을 검증하고, Phase 3에서 커버리지를 확대한다. 초기에는 Kaggle 데이터 적재가 필요하지만 DB가 채워질수록 재적재 빈도가 낮아지는 구조가 Strangler Fig와 같은 점진적 전환이다.
 
 ---
 
