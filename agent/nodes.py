@@ -234,7 +234,7 @@ def _build_sql(query: str, source_site: str | None = None) -> str:
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     return (
-        "SELECT id, name, brand, category, price, rating, review_count "
+        "SELECT id, name, brand, category, price, rating, review_count, source_url "
         f"FROM normalized_products {where} ORDER BY rating DESC NULLS LAST LIMIT 20"
     )
 

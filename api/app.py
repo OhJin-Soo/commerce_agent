@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_ollama import ChatOllama
 
 from agent import GraphDeps, build_graph
@@ -48,6 +49,12 @@ def create_app() -> FastAPI:
         version="0.1.0",
         description="Search-augmented commerce agent API",
         lifespan=lifespan,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173"],
+        allow_methods=["POST"],
+        allow_headers=["Content-Type"],
     )
     app.include_router(router)
     return app
