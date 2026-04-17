@@ -7,6 +7,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/query": "http://localhost:8000",
+      "/rate": "http://localhost:8000",
     },
   },
 })
