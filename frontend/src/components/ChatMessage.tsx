@@ -3,9 +3,10 @@ import ProductGrid from "./ProductGrid"
 
 interface Props {
   message: Message
+  rate: number
 }
 
-export default function ChatMessage({ message }: Props) {
+export default function ChatMessage({ message, rate }: Props) {
   const isUser = message.role === "user"
 
   return (
@@ -30,7 +31,7 @@ export default function ChatMessage({ message }: Props) {
         {/* 상품 카드 */}
         {message.products && message.products.length > 0 && (
           <div className="w-full mt-1">
-            <ProductGrid products={message.products} />
+            <ProductGrid products={message.products} rate={rate} />
           </div>
         )}
       </div>

@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from api.deps import get_graph
+from api.deps import get_exchange_rate, get_graph
 from api.models import QueryRequest, QueryResponse
 
 logger = logging.getLogger(__name__)
@@ -41,3 +41,9 @@ async def query_endpoint(
         sql_rows=result.get("sql_rows", []),
         error=result.get("error"),
     )
+
+
+@router.get("/rate", summary="INR→KRW 환율 조회")
+async def rate_endpoint(rate: float = Depends(get_exchange_rate)) -> dict:
+    """앱 시작 시 조회한 실시간 INR→KRW 환율을 반환한다."""
+    return {"inr_to_krw": rate}

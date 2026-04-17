@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { postQuery } from "./api"
+import { fetchRate, postQuery } from "./api"
 import ChatInput from "./components/ChatInput"
 import ChatMessage from "./components/ChatMessage"
 import type { Message } from "./types"
@@ -14,7 +14,12 @@ const SUGGESTIONS = [
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [loading, setLoading] = useState(false)
+  const [rate, setRate] = useState<number>(16.0)
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    fetchRate().then(setRate)
+  }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -90,7 +95,7 @@ export default function App() {
           )}
 
           {messages.map((msg) => (
-            <ChatMessage key={msg.id} message={msg} />
+            <ChatMessage key={msg.id} message={msg} rate={rate} />
           ))}
 
           {loading && (

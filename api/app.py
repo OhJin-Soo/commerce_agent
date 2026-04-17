@@ -11,6 +11,7 @@ from langchain_ollama import ChatOllama
 
 from agent import GraphDeps, build_graph
 from api.routes import router
+from db.currency import fetch_inr_to_krw
 from db.session import AsyncSessionLocal
 
 load_dotenv()
@@ -28,15 +29,18 @@ async def lifespan(app: FastAPI):
     )
     ingest_nrows = int(os.getenv("KAGGLE_NROWS", "50000"))
 
-    logger.info("Building graph  model=%s  dataset=%s", model, ingest_handle)
+    exchange_rate = await fetch_inr_to_krw()
+    logger.info("Building graph  model=%s  dataset=%s  INR→KRW=%.2f", model, ingest_handle, exchange_rate)
 
     deps = GraphDeps(
         session_factory=AsyncSessionLocal,
         llm=ChatOllama(model=model),
         dataset_handle=ingest_handle,
         ingest_nrows=ingest_nrows,
+        exchange_rate=exchange_rate,
     )
     app.state.graph = build_graph(deps)
+    app.state.exchange_rate = exchange_rate
     logger.info("Graph ready")
 
     yield

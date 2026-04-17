@@ -12,3 +12,14 @@ export async function postQuery(query: string): Promise<QueryResponse> {
   }
   return res.json()
 }
+
+export async function fetchRate(): Promise<number> {
+  try {
+    const res = await fetch("/rate")
+    if (!res.ok) return 16.0
+    const data = await res.json()
+    return data.inr_to_krw ?? 16.0
+  } catch {
+    return 16.0
+  }
+}

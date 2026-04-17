@@ -2,9 +2,17 @@ import type { ProductRow } from "../types"
 
 interface Props {
   products: ProductRow[]
+  rate: number
 }
 
-export default function ProductGrid({ products }: Props) {
+function toKrw(inrPrice: string | null, rate: number): string {
+  if (inrPrice == null) return "가격 미상"
+  const n = parseFloat(inrPrice)
+  if (isNaN(n)) return "가격 미상"
+  return `₩${Math.round(n * rate).toLocaleString()}`
+}
+
+export default function ProductGrid({ products, rate }: Props) {
   if (products.length === 0) return null
 
   return (
@@ -30,9 +38,7 @@ export default function ProductGrid({ products }: Props) {
           )}
           <div className="mt-2 flex items-center justify-between text-xs text-gray-500">
             <span className="font-semibold text-indigo-600 text-sm">
-              {p.price != null
-                ? `₹${Number(p.price).toLocaleString()}`
-                : "가격 미상"}
+              {toKrw(p.price, rate)}
             </span>
             <div className="flex items-center gap-2">
               {p.rating != null && (

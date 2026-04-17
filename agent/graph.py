@@ -55,6 +55,7 @@ class GraphDeps:
     dataset_handle: str = "lokeshparab/amazon-products-dataset"
     ingest_source_site: str = "kaggle/amazon-products"
     ingest_nrows: int | None = None    # None = 전체, 정수 = 행 수 제한
+    exchange_rate: float = 16.0        # INR → KRW 환율 (앱 시작 시 실시간 갱신)
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +98,8 @@ def build_graph(deps: GraphDeps):
         dataset_handle=deps.dataset_handle,
         ingest_nrows=deps.ingest_nrows,
     ))
-    workflow.add_node("run_sql",           make_run_sql_node(deps.session_factory))
-    workflow.add_node("generate_response", make_generate_response_node(deps.llm))
+    workflow.add_node("run_sql",           make_run_sql_node(deps.session_factory, exchange_rate=deps.exchange_rate))
+    workflow.add_node("generate_response", make_generate_response_node(deps.llm, exchange_rate=deps.exchange_rate))
 
     workflow.set_entry_point("classify_intent")
 

@@ -209,24 +209,30 @@ def make_run_ingestion_node(
 # 4. run_sql  — session_factory 필요
 # ---------------------------------------------------------------------------
 
-def _build_sql(query: str, source_site: str | None = None) -> str:
+def _build_sql(
+    query: str,
+    source_site: str | None = None,
+    exchange_rate: float = 1.0,
+) -> str:
     """키워드 → SQL 변환 (Phase 1 스켈레톤).
 
+    DB 가격은 INR 기준이므로, 사용자 KRW 입력을 exchange_rate 로 나눠 INR 로 변환한다.
     Phase 2 에서 LangChain SQLAgent / LLM 기반 NL→SQL 로 교체 예정.
     """
     q = query.lower()
     conditions: list[str] = []
 
-    # 가격 조건 (한국어 단위 만/천 포함)
+    # 가격 조건: KRW 입력 → INR 변환 후 DB 비교
     m = _PRICE_RE.search(q)
     if m:
         base = int(m.group(1).replace(",", ""))
         unit = _UNIT.get(m.group(2) or "", 1)
-        amount = base * unit
+        krw_amount = base * unit
+        inr_amount = int(krw_amount / exchange_rate) if exchange_rate else krw_amount
         if "이하" in q or "미만" in q:
-            conditions.append(f"price <= {amount}")
+            conditions.append(f"price <= {inr_amount}")
         elif "이상" in q or "초과" in q:
-            conditions.append(f"price >= {amount}")
+            conditions.append(f"price >= {inr_amount}")
 
     # source_site 조건 (CSV 단위로 적재했으므로 이걸로 카테고리 필터)
     if source_site:
@@ -239,10 +245,13 @@ def _build_sql(query: str, source_site: str | None = None) -> str:
     )
 
 
-def make_run_sql_node(session_factory: async_sessionmaker) -> NodeFn:
+def make_run_sql_node(
+    session_factory: async_sessionmaker,
+    exchange_rate: float = 1.0,
+) -> NodeFn:
     async def run_sql(state: AgentState) -> dict:
         source_site = _source_site_from(state.get("csv_filename"))
-        sql = _build_sql(state["query"], source_site)
+        sql = _build_sql(state["query"], source_site, exchange_rate)
         logger.debug("run_sql: %s", sql)
         try:
             async with session_factory() as session:
@@ -261,25 +270,35 @@ def make_run_sql_node(session_factory: async_sessionmaker) -> NodeFn:
 # 5. generate_response  — BaseChatModel 필요
 # ---------------------------------------------------------------------------
 
-def make_generate_response_node(llm) -> NodeFn:  # type: ignore[type-arg]
+def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # type: ignore[type-arg]
     """sql_rows(있으면) + query 를 바탕으로 자연어 응답을 생성한다.
 
+    DB 가격(INR)을 exchange_rate 로 곱해 KRW 로 변환 후 LLM 컨텍스트에 전달한다.
     `llm` 은 `langchain_core.language_models.BaseChatModel` 호환 객체.
     Phase 2 에서 HuggingFace 서빙 엔드포인트로 교체 예정.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
     SYSTEM = (
-        "당신은 커머스 어시스턴트입니다. "
-        "상품 데이터를 기반으로 사용자 질문에 한국어로 간결하게 답변하세요."
+        "You are a Korean commerce assistant. "
+        "IMPORTANT: You MUST respond ONLY in Korean (한국어). "
+        "Do NOT use any other language. Every word must be Korean. "
+        "Answer concisely based on the product data. "
+        "Always express prices in Korean Won (₩)."
     )
+
+    def _to_krw(inr_price) -> str:
+        try:
+            return f"₩{int(float(inr_price) * exchange_rate):,}"
+        except (TypeError, ValueError):
+            return "가격 미상"
 
     async def generate_response(state: AgentState) -> dict:
         rows = state.get("sql_rows", [])
         context = (
             "\n".join(
                 f"- {r.get('name')} ({r.get('brand')}) "
-                f"가격={r.get('price')}원 평점={r.get('rating')}"
+                f"가격={_to_krw(r.get('price'))} 평점={r.get('rating')}"
                 for r in rows[:10]
             )
             if rows
