@@ -14,3 +14,8 @@ wheels/
 
 # Environment variables (contains secrets)
 .env
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
