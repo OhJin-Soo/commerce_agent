@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from typing import Literal, NotRequired, TypedDict
 
-# Intent 값: intent_router 노드가 결정한다.
-#   "sql"    → normalized_products 직접 조회
-#   "ingest" → Kaggle 적재 후 SQL 조회
-#   "llm"    → LLM 해석/추천 응답
-Intent = Literal["sql", "ingest", "llm"]
+# Intent 값: classify_intent 노드가 결정한다.
+#   "sql" → check_loaded → (run_ingestion →) run_sql → generate_response
+#   "llm" → generate_response
+Intent = Literal["sql", "llm"]
 
 
 class AgentState(TypedDict):
@@ -15,13 +14,17 @@ class AgentState(TypedDict):
     # --- 입력 (항상 필수) ---
     query: str
 
-    # --- intent_router 가 채운다 ---
+    # --- classify_intent 가 채운다 ---
     intent: NotRequired[Intent]
+    category: NotRequired[str | None]   # 쿼리에서 추출한 상품 카테고리
 
-    # --- sql_query 노드가 채운다 ---
+    # --- check_loaded 가 채운다 ---
+    data_loaded: NotRequired[bool]      # True → run_sql, False → run_ingestion
+
+    # --- run_sql 이 채운다 ---
     sql_rows: NotRequired[list[dict]]
 
-    # --- llm_respond 노드가 채운다 ---
+    # --- generate_response 가 채운다 ---
     response: NotRequired[str]
 
     # --- 어느 노드든 오류 발생 시 채운다 ---
