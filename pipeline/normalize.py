@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -187,10 +188,20 @@ def _candidates(spec: str | list[str] | None) -> list[str]:
     return [spec] if isinstance(spec, str) else spec
 
 
+def _is_missing(val: Any) -> bool:
+    """None 또는 pandas/numpy NaN 을 '값 없음'으로 판단한다."""
+    if val is None:
+        return True
+    try:
+        return isinstance(val, float) and math.isnan(val)
+    except (TypeError, ValueError):
+        return False
+
+
 def _pick_raw(row: _LowerKeyView, spec: str | list[str] | None) -> Any:
     for col in _candidates(spec):
         val = row.get(col)
-        if val is not None:
+        if not _is_missing(val):
             return val
     return None
 
