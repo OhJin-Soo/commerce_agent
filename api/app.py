@@ -4,13 +4,15 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from langchain_ollama import ChatOllama
 
 from agent import GraphDeps, build_graph
 from api.routes import router
 from db.session import AsyncSessionLocal
-from pipeline.kaggle_load import KaggleDatasetConfig
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ async def lifespan(app: FastAPI):
     model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
     ingest_handle = os.getenv(
         "KAGGLE_DATASET_HANDLE",
-        "asaniczka/amazon-products-dataset-2023-1-4m-products",
+        "lokeshparab/amazon-products-dataset",
     )
     ingest_nrows = int(os.getenv("KAGGLE_NROWS", "50000"))
 
@@ -30,10 +32,8 @@ async def lifespan(app: FastAPI):
     deps = GraphDeps(
         session_factory=AsyncSessionLocal,
         llm=ChatOllama(model=model),
-        ingest_config=KaggleDatasetConfig(
-            handle=ingest_handle,
-            nrows=ingest_nrows,
-        ),
+        dataset_handle=ingest_handle,
+        ingest_nrows=ingest_nrows,
     )
     app.state.graph = build_graph(deps)
     logger.info("Graph ready")

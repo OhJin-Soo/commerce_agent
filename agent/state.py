@@ -16,10 +16,11 @@ class AgentState(TypedDict):
 
     # --- classify_intent 가 채운다 ---
     intent: NotRequired[Intent]
-    category: NotRequired[str | None]   # 쿼리에서 추출한 상품 카테고리
+    category: NotRequired[str | None]       # 사람이 읽을 수 있는 카테고리명 (e.g. "Headphones")
+    csv_filename: NotRequired[str | None]   # Kaggle CSV 파일명 (e.g. "Headphones.csv")
 
     # --- check_loaded 가 채운다 ---
-    data_loaded: NotRequired[bool]      # True → run_sql, False → run_ingestion
+    data_loaded: NotRequired[bool]          # True → run_sql, False → run_ingestion
 
     # --- run_sql 이 채운다 ---
     sql_rows: NotRequired[list[dict]]
