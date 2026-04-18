@@ -468,14 +468,102 @@ def make_run_sql(llm, session):
     return run_sql
 ```
 
-#### SQL 품질 지표 측정
+#### SQL 품질 평가 인프라
 
-Stage 2 전환 여부는 `evals/` 골든셋 실행 결과로 판단한다.
+Stage 2 전환 여부는 SQL 품질 평가 결과로 판단한다. 지표는 두 레벨로 나뉜다.
+
+```
+입력 쿼리 목록 (N개)
+        │
+        ▼
+   LLM → SQL 생성
+        │
+   ┌────┴──────────────────────────────┐
+   │                                   │
+   ▼                                   ▼
+스키마 파싱 대조                   DB 실행 + 결과 집합 비교
+(골든셋 불필요)                    (골든셋 필요)
+```
+
+##### Probe 지표 — 골든셋 불필요
+
+입력 쿼리 목록과 실제 DB 스키마만 있으면 측정 가능.
 
 | 지표 | 설명 | 측정 방법 |
 |---|---|---|
-| `schema_invalid_rate` | 존재하지 않는 테이블·컬럼 참조 비율 | 스키마 목록 대조 |
-| `execution_failure_rate` | DB 실행 오류 발생 비율 | PostgreSQL 오류 캐치 |
+| `schema_invalid_rate` | 존재하지 않는 테이블·컬럼 참조 비율 | sqlglot 파싱 후 스키마 대조 |
+| `execution_failure_rate` | DB 실행 오류 발생 비율 | `EXPLAIN {sql}` 예외 캐치 |
+
+##### Golden Set 지표 — (query, reference_sql) 쌍 필요
+
+| 지표 | 설명 | 임계값 |
+|---|---|---|
+| `execution_accuracy` (EX) | 결과 집합 완전 일치율 | ≥ 0.70 |
+| `result_f1` | 반환 행 id 기준 F1 (부분 일치 허용) | ≥ 0.85 |
+| `table_match_rate` | 테이블명 일치율 | = 1.00 |
+| `condition_match_rate` | WHERE 절 일치율 | ≥ 0.70 |
+
+골든셋은 `tests/eval/golden_set.py`에 정의되며, `exchange_rate=16.0` 기준 레퍼런스 SQL을 수동 검증해 기록한다.
+
+##### Stage 2 진입 게이트
+
+Hard gate 하나라도 실패하면 Stage 2 진입 불가. Soft gate는 경고만 출력.
+
+| 지표 | 임계값 | 게이트 종류 | 근거 |
+|---|---|---|---|
+| `schema_invalid_rate` | = 0.00 | **Hard** | 없는 테이블 참조는 즉시 런타임 오류 |
+| `table_match_rate` | = 1.00 | **Hard** | 테이블 틀리면 Retry 전략이 의미 없음 |
+| `execution_failure_rate` | ≤ 0.05 | **Hard** | 10개 중 1개 이상 실패면 UX 불가 |
+| `execution_accuracy` | ≥ 0.70 | Soft | 10개 중 7개 정확한 결과 집합 |
+| `result_f1` | ≥ 0.85 | Soft | 부분 일치 포함 85% |
+| `condition_match_rate` | ≥ 0.70 | Soft | WHERE 절 70% 이상 일치 |
+
+임계값은 **규칙 기반 Phase 1 수치를 baseline으로** 삼아 결정한다. 규칙 기반 EX=1.0 이면 LLM 목표를 0.70으로 잡는 방식.
+
+##### 평가 인프라 파일 구조
+
+```
+tests/eval/
+├── golden_set.py        # (query, reference_sql) 쌍 10개 이상
+├── metrics.py           # check_schema / execution_accuracy / result_f1 / component_match
+├── runner.py            # run_eval() → EvalSummary + DB 기록
+├── thresholds.py        # StageGate 정의 + check_gates()
+├── test_eval_metrics.py # metrics 단위 테스트 (DB 불필요)
+└── test_eval_runner.py  # runner 단위 테스트 (DB mock)
+
+eval.py                  # 평가 실행 CLI 진입점
+```
+
+측정 결과는 `eval_runs` / `eval_cases` 테이블에 기록되며, 모델 이름(`--model`) 기준으로 시계열 비교가 가능하다.
+
+```bash
+# 규칙 기반 baseline 측정
+uv run python eval.py --model rule-based-v1
+
+# LLM 도입 후 Stage 2 게이트 체크
+uv run python eval.py --model llama3.1:8b
+```
+
+출력 예시:
+
+```
+=== EvalSummary [llama3.1:8b] (n=10) ===
+  schema_invalid_rate    : 0.0%
+  execution_failure_rate : 0.0%
+  execution_accuracy     : 65.0%
+  result_f1              : 78.0%
+  table_match_rate       : 100.0%
+  condition_match_rate   : 75.0%
+
+  [PASS] schema_invalid_rate         0.0%   (threshold lte 0%)
+  [PASS] table_match_rate            100.0% (threshold eq 100%)
+  [PASS] execution_failure_rate      0.0%   (threshold lte 5%)
+  [WARN] execution_accuracy          65.0%  (threshold gte 70%)
+  [WARN] result_f1                   78.0%  (threshold gte 85%)
+  [PASS] condition_match_rate        75.0%  (threshold gte 70%)
+
+△ 진입 가능하나 Soft gate 미달: ['execution_accuracy', 'result_f1']
+```
 
 목표 수준을 초과하면 Stage 2를 적용한다.
 
