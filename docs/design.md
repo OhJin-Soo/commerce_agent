@@ -505,20 +505,102 @@ Stage 2 전환 여부는 SQL 품질 평가 결과로 판단한다. 지표는 두
 
 골든셋은 `tests/eval/golden_set.py`에 정의되며, `exchange_rate=16.0` 기준 레퍼런스 SQL을 수동 검증해 기록한다.
 
-##### Stage 2 진입 게이트
+##### Stage 전환 게이트
 
-Hard gate 하나라도 실패하면 Stage 2 진입 불가. Soft gate는 경고만 출력.
+**품질 기준치**는 "이 시스템이 운영되려면 반드시 필요한 최소 품질"을 의미한다. Stage는 이 기준치에 도달하기 위한 수단이며, 순차적 의무가 아닌 **조건부 업그레이드**다.
 
-| 지표 | 임계값 | 게이트 종류 | 근거 |
-|---|---|---|---|
-| `schema_invalid_rate` | = 0.00 | **Hard** | 없는 테이블 참조는 즉시 런타임 오류 |
-| `table_match_rate` | = 1.00 | **Hard** | 테이블 틀리면 Retry 전략이 의미 없음 |
-| `execution_failure_rate` | ≤ 0.05 | **Hard** | 10개 중 1개 이상 실패면 UX 불가 |
-| `execution_accuracy` | ≥ 0.70 | Soft | 10개 중 7개 정확한 결과 집합 |
-| `result_f1` | ≥ 0.85 | Soft | 부분 일치 포함 85% |
-| `condition_match_rate` | ≥ 0.70 | Soft | WHERE 절 70% 이상 일치 |
+> Stage 1에서 이미 품질 기준을 달성했다면 Stage 2는 도입하지 않는다. 기준을 임의로 올려 Stage 2를 정당화해선 안 된다. 기준치는 시스템 요구사항에서 결정되며, Stage 도입 여부는 그 결과다.
+
+**전체 전환 흐름**
+
+```
+품질 기준 (목표치) : execution_accuracy ≥ 0.85 / result_f1 ≥ 0.92 / condition_match_rate ≥ 0.85
+구조적 전제 조건  : schema_invalid_rate = 0.00 / table_match_rate = 1.00 / execution_failure_rate ≤ 0.05
+
+Stage 1 — 범용 LLM 직접 생성
+    │
+    │  eval.py 실행
+    │
+    ├─[구조적 전제 미달]─→ 프롬프트 개선 후 재측정  ←──────────────────┐
+    │  (달성 못하면 Stage 2 Validator 자체가 작동 안 함)                 │
+    │                                                                   │
+    ├─[품질 기준 달성]────────────────────────────────→ 운영            │
+    │                                                  Stage 2 불필요   │
+    │                                                                   │
+    └─[품질 기준 미달]                                                  │
+              │                                                         │
+              ▼                                                         │
+        Stage 2 도입 — Validator + Retry                                │
+              │                                                         │
+              │  eval.py 반복 실행 (Retry 프롬프트 튜닝)                 │
+              │                                                         │
+              ├─[품질 기준 미달]─→ 프롬프트 개선 후 재측정 ──────────────┘
+              │
+              ├─[품질 기준 달성]────────────────────────→ 운영
+              │                                          Stage 3 불필요
+              │
+              └─[Retry로도 품질 기준 달성 불가]
+                        │
+                        ▼
+                  Stage 3 도입 — 범용 LLM(의도 해석) + SQLCoder(SQL 생성)
+                        │
+                        │  eval.py 반복 실행 (SQLCoder 튜닝)
+                        │
+                        ├─[품질 기준 미달]─→ SQLCoder 개선 or Stage 3 철회
+                        │
+                        └─[품질 기준 달성]────────────────→ 운영
+                                   회귀 방어선 + 신규 모니터링
+                                   complex_query_ex       ≥ 0.60
+                                   intent_struct_accuracy ≥ 0.90
+                                   p95_latency_ms         ≤ 3000
+```
+
+**Stage 1 구조적 전제 조건이 품질 수치와 다른 이유**
+
+품질 기준(execution_accuracy 등)은 "얼마나 잘 맞추는가"의 문제다. 반면 Stage 1의 구조적 전제 조건은 **Validator + Retry 메커니즘이 작동하기 위해 반드시 충족되어야 하는 조건**으로, 이것이 깨지면 Stage 2 자체가 무력화된다.
+
+| 지표 | 임계값 | 전제 조건인 이유 |
+|---|---|---|
+| `schema_invalid_rate` | = 0.00 | 없는 테이블을 참조하면 Retry해도 LLM이 같은 실수를 반복한다. Validator가 잡아도 근본 해결 불가 |
+| `table_match_rate` | = 1.00 | 같은 이유 |
+| `execution_failure_rate` | ≤ 0.05 | SQL이 실행조차 안 되면 결과 비교가 불가하므로 Validator 자체가 작동하지 않는다 |
 
 임계값은 **규칙 기반 Phase 1 수치를 baseline으로** 삼아 결정한다. 규칙 기반 EX=1.0 이면 LLM 목표를 0.70으로 잡는 방식.
+
+**품질 기준치는 Stage와 무관하게 동일하다**
+
+품질 기준(≥ 0.85)은 Stage 1이든 Stage 2든 Stage 3이든 동일하게 적용된다. 어느 Stage에서든 달성하면 운영이며, 다음 Stage는 도입하지 않는다. Stage 3이 목표로 하는 수치가 높아 보이는 이유는 Stage 3의 기준이 높아서가 아니라, Stage 1·2가 이 기준에 미달해서 Stage 3까지 오게 된 것이다.
+
+| 지표 | 품질 기준 (전 Stage 공통) | Stage 3 진입 시점 상태 |
+|---|---|---|
+| `execution_accuracy` | ≥ 0.85 | Stage 2에서 미달 |
+| `result_f1` | ≥ 0.92 | Stage 2에서 미달 |
+| `condition_match_rate` | ≥ 0.85 | Stage 2에서 미달 |
+
+**왜 처음부터 Stage 3을 도입하지 않는가**
+
+> 더 단순한 구조로 품질 기준을 달성할 수 있는지를 먼저 확인하기 위해서다. 복잡도는 측정된 필요에 의해서만 추가한다.
+
+| 이유 | 설명 |
+|---|---|
+| 비용 | Stage 3은 두 모델(범용 LLM + SQLCoder)을 동시에 운영한다. Stage 1·2에서 품질 기준을 달성할 수 있다면 모델을 추가로 운영할 이유가 없다 |
+| 디버깅 복잡도 | Stage 3에서 결과가 틀리면 범용 LLM의 의도 해석 실패인지, SQLCoder의 SQL 생성 실패인지 원인이 둘이다. Stage 1은 원인이 하나라 디버깅이 단순하다 |
+| baseline 없이 개선을 측정할 수 없다 | Stage 1 수치 없이 Stage 3을 도입하면 얼마나 개선됐는지 알 수 없다. `eval.py` 시계열 비교는 단순한 것부터 측정해야 의미를 갖는다 |
+| Validator 재사용 | Stage 2의 Validator + Retry는 Stage 3에서도 SQLCoder 출력을 검증하는 데 재사용된다. Stage 2를 건너뛰면 이 컴포넌트를 검증할 기회가 없다 |
+
+**품질 기준치의 역할**
+
+| 역할 | 설명 |
+|---|---|
+| Stage 도입 판단 | 현재 Stage에서 달성 시 → 다음 Stage 불필요. 미달 시 → 다음 Stage 도입 |
+| 개선 방향 제시 | 미달 지표가 곧 튜닝 우선순위 |
+| 회귀 감지 | 프롬프트·모델 변경 시 수치가 내려가면 즉시 회귀로 판단 |
+
+```sql
+-- 회귀 감지용 시계열 조회
+SELECT created_at, model_name, execution_accuracy, result_f1
+FROM eval_runs ORDER BY created_at DESC;
+```
 
 ##### 평가 인프라 파일 구조
 
@@ -540,29 +622,8 @@ eval.py                  # 평가 실행 CLI 진입점
 # 규칙 기반 baseline 측정
 uv run python eval.py --model rule-based-v1
 
-# LLM 도입 후 Stage 2 게이트 체크
+# LLM 도입 후 품질 기준 체크
 uv run python eval.py --model llama3.1:8b
-```
-
-출력 예시:
-
-```
-=== EvalSummary [llama3.1:8b] (n=10) ===
-  schema_invalid_rate    : 0.0%
-  execution_failure_rate : 0.0%
-  execution_accuracy     : 65.0%
-  result_f1              : 78.0%
-  table_match_rate       : 100.0%
-  condition_match_rate   : 75.0%
-
-  [PASS] schema_invalid_rate         0.0%   (threshold lte 0%)
-  [PASS] table_match_rate            100.0% (threshold eq 100%)
-  [PASS] execution_failure_rate      0.0%   (threshold lte 5%)
-  [WARN] execution_accuracy          65.0%  (threshold gte 70%)
-  [WARN] result_f1                   78.0%  (threshold gte 85%)
-  [PASS] condition_match_rate        75.0%  (threshold gte 70%)
-
-△ 진입 가능하나 Soft gate 미달: ['execution_accuracy', 'result_f1']
 ```
 
 목표 수준을 초과하면 Stage 2를 적용한다.
@@ -1403,3 +1464,124 @@ asyncio.run(main())
 - **TTFT / p95 latency** 우선: 사용자 질의 응답이 주 목적
 - **SQL 생성 시나리오** 가중: `run_sql`은 매 질의마다 호출되는 핵심 경로
 - 동점 시 VRAM 사용량이 적은 쪽 선택
+
+---
+
+## SQL 품질 회귀 감지
+
+**정기 실행은 하지 않는다.** SQL 품질은 프롬프트·규칙 코드·모델 버전이 바뀔 때만 변한다. Kaggle CSV는 정적이고 외부 API 모델도 없으므로 push/PR 트리거만으로 충분하다.
+
+**알림은 GitHub Actions에서만.** 로컬 실행은 강제할 수 없으므로 품질 게이트로 신뢰할 수 없다. 로컬에서는 터미널 출력으로 충분하다.
+
+ci.yml, eval.yml 모두 동일한 `SLACK_WEBHOOK_URL`을 사용한다. 채널 하나에서 두 워크플로의 결과를 함께 확인한다.
+
+```
+# 성공
+✅ CI 통과 — develop @ a1b2c3d
+lint-backend ✅  lint-frontend ✅  test ✅  docker-build ✅
+SQL 품질 ✅  EX=0.92  F1=0.95
+
+# 실패
+❌ CI 실패 — develop @ a1b2c3d
+lint-backend ✅  lint-frontend ✅  test ❌  docker-build ✅
+SQL 품질 ❌  execution_accuracy 0.91 → 0.84  (-0.07)
+```
+
+`SLACK_WEBHOOK_URL`은 GitHub Actions secrets에만 설정한다. 로컬에 환경변수가 없으면 Slack 발송이 자동 생략된다.
+
+복잡도가 높아지는 시점에만 별도 오케스트레이션 도구를 도입한다.
+
+| 상황 | 도구 |
+|---|---|
+| 단일 eval 스크립트, push/PR 검증 | **GitHub Actions** |
+| 복수 모델 병렬 평가, 태스크 간 의존성 | **Prefect** |
+| 전용 모니터링 UI, 월 수천 분 이상 실행 | **Airflow** |
+
+---
+
+## CI 파이프라인
+
+### 목적
+
+코드 변경이 발생할 때마다 자동으로 품질 게이트를 통과시킨다. 정기 실행은 하지 않는다(품질은 코드 변경 시에만 달라지므로).
+
+### 워크플로 구성
+
+`.github/workflows/ci.yml` 단일 파일로 관리한다. push/PR 트리거에만 반응하며 아래 4개 잡이 독립 실행된다(공통 의존성 없음 → 병렬).
+
+```
+push / PR
+    ├── lint-backend    ruff (Python)
+    ├── lint-frontend   eslint + tsc --noEmit
+    ├── test            unit (mock) → integration (real postgres)
+    └── docker-build    backend image + frontend image
+```
+
+eval 회귀 검사(`eval.yml`)는 별도 워크플로로 분리한다. CI와 관심사가 다르기 때문이다.
+
+| 워크플로 | 목적 | 트리거 |
+|---|---|---|
+| `ci.yml` | 코드 품질·빌드 검증 | push, PR |
+| `eval.yml` | SQL 생성 품질 회귀 감지 + Slack 알림 | push, PR |
+
+### 잡 설계
+
+#### lint-backend
+
+- **도구**: `ruff` (lint + format check)
+- **대상**: `*.py` 전체
+- **DB 불필요**, postgres 서비스 없음
+
+#### lint-frontend
+
+- **도구**: `eslint` (린트), `tsc --noEmit` (타입 체크)
+- **작업 디렉터리**: `frontend/`
+- `npm ci` 후 실행
+
+#### test
+
+순서 의존성이 있으므로 단일 잡 내 2-step으로 구성한다.
+
+**Step 1 — 단위 테스트** (DB 없음)
+
+- 대상: 현재 모든 테스트 (`tests/`)
+- mock 기반이므로 postgres 서비스 불필요
+- 빠른 피드백을 위해 먼저 실행
+
+**Step 2 — 통합 테스트** (real postgres)
+
+- postgres:16-alpine 서비스 컨테이너 사용
+- `alembic upgrade head` → 마이그레이션 적용 검증
+- 이후 DB가 필요한 테스트 실행 (`-m integration` 마커)
+
+Step 1이 실패하면 Step 2는 실행하지 않는다.
+
+#### docker-build
+
+빌드 성공 여부만 확인한다. push(registry에 업로드)는 하지 않는다.
+
+| 이미지 | 컨텍스트 | Dockerfile 위치 |
+|---|---|---|
+| `commerce-agent-backend` | 프로젝트 루트 | `Dockerfile` |
+| `commerce-agent-frontend` | `frontend/` | `frontend/Dockerfile` |
+
+백엔드: `python:3.11-slim` + uv 멀티스테이지. uv 바이너리를 `ghcr.io/astral-sh/uv` 이미지에서 복사해 `pip install uv` 레이어를 제거한다.
+
+프론트엔드: `node:20-alpine` 빌드 스테이지 → `nginx:alpine` 런타임. `npm run build` 결과물(`dist/`)만 nginx 이미지에 포함한다.
+
+### 필요한 파일
+
+```
+.
+├── Dockerfile                    # 백엔드 이미지
+├── frontend/
+│   └── Dockerfile                # 프론트엔드 이미지
+└── .github/
+    └── workflows/
+        ├── ci.yml                # lint + test + docker-build
+        └── eval.yml              # SQL 품질 평가 (기존)
+```
+
+백엔드 Dockerfile에서 `uv sync --no-dev --frozen`을 사용해 dev 의존성을 이미지에 포함하지 않는다. lint 잡은 `uv sync --group dev`로 dev 의존성만 추가로 설치한다.
+
+**Slack 알림은 eval.yml과 동일한 웹훅을 사용한다.** `SLACK_WEBHOOK_URL` 시크릿 하나로 두 워크플로의 결과가 같은 채널에 수신된다. ci.yml은 모든 잡 완료 후 결과를 하나의 메시지로 발송한다.
