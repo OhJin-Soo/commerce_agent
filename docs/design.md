@@ -1467,38 +1467,6 @@ asyncio.run(main())
 
 ---
 
-## SQL 품질 회귀 감지
-
-**정기 실행은 하지 않는다.** SQL 품질은 프롬프트·규칙 코드·모델 버전이 바뀔 때만 변한다. Kaggle CSV는 정적이고 외부 API 모델도 없으므로 push/PR 트리거만으로 충분하다.
-
-**알림은 GitHub Actions에서만.** 로컬 실행은 강제할 수 없으므로 품질 게이트로 신뢰할 수 없다. 로컬에서는 터미널 출력으로 충분하다.
-
-ci.yml, eval.yml 모두 동일한 `SLACK_WEBHOOK_URL`을 사용한다. 채널 하나에서 두 워크플로의 결과를 함께 확인한다.
-
-```
-# 성공
-✅ CI 통과 — develop @ a1b2c3d
-lint-backend ✅  lint-frontend ✅  test ✅  docker-build ✅
-SQL 품질 ✅  EX=0.92  F1=0.95
-
-# 실패
-❌ CI 실패 — develop @ a1b2c3d
-lint-backend ✅  lint-frontend ✅  test ❌  docker-build ✅
-SQL 품질 ❌  execution_accuracy 0.91 → 0.84  (-0.07)
-```
-
-`SLACK_WEBHOOK_URL`은 GitHub Actions secrets에만 설정한다. 로컬에 환경변수가 없으면 Slack 발송이 자동 생략된다.
-
-복잡도가 높아지는 시점에만 별도 오케스트레이션 도구를 도입한다.
-
-| 상황 | 도구 |
-|---|---|
-| 단일 eval 스크립트, push/PR 검증 | **GitHub Actions** |
-| 복수 모델 병렬 평가, 태스크 간 의존성 | **Prefect** |
-| 전용 모니터링 UI, 월 수천 분 이상 실행 | **Airflow** |
-
----
-
 ## CI 파이프라인
 
 ### 목적
@@ -1584,4 +1552,32 @@ Step 1이 실패하면 Step 2는 실행하지 않는다.
 
 백엔드 Dockerfile에서 `uv sync --no-dev --frozen`을 사용해 dev 의존성을 이미지에 포함하지 않는다. lint 잡은 `uv sync --group dev`로 dev 의존성만 추가로 설치한다.
 
-**Slack 알림은 eval.yml과 동일한 웹훅을 사용한다.** `SLACK_WEBHOOK_URL` 시크릿 하나로 두 워크플로의 결과가 같은 채널에 수신된다. ci.yml은 모든 잡 완료 후 결과를 하나의 메시지로 발송한다.
+### Slack 알림
+
+**알림은 GitHub Actions에서만.** 로컬 실행은 강제할 수 없으므로 품질 게이트로 신뢰할 수 없다. 로컬에서는 터미널 출력으로 충분하다.
+
+**정기 실행은 하지 않는다.** SQL 품질은 프롬프트·규칙 코드·모델 버전이 바뀔 때만 변한다. Kaggle CSV는 정적이고 외부 API 모델도 없으므로 push/PR 트리거만으로 충분하다.
+
+ci.yml, eval.yml 모두 동일한 `SLACK_WEBHOOK_URL`을 사용한다. 채널 하나에서 두 워크플로의 결과를 하나의 메시지로 확인한다.
+
+```
+# 성공
+✅ CI 통과 — develop @ a1b2c3d
+lint-backend ✅  lint-frontend ✅  test ✅  docker-build ✅
+SQL 품질 ✅  EX=0.92  F1=0.95
+
+# 실패
+❌ CI 실패 — develop @ a1b2c3d
+lint-backend ✅  lint-frontend ✅  test ❌  docker-build ✅
+SQL 품질 ❌  execution_accuracy 0.91 → 0.84  (-0.07)
+```
+
+`SLACK_WEBHOOK_URL`은 GitHub Actions secrets에만 설정한다. 로컬에 환경변수가 없으면 Slack 발송이 자동 생략된다.
+
+복잡도가 높아지는 시점에만 별도 오케스트레이션 도구를 도입한다.
+
+| 상황 | 도구 |
+|---|---|
+| 단일 eval 스크립트, push/PR 검증 | **GitHub Actions** |
+| 복수 모델 병렬 평가, 태스크 간 의존성 | **Prefect** |
+| 전용 모니터링 UI, 월 수천 분 이상 실행 | **Airflow** |
