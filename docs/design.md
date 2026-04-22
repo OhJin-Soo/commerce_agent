@@ -38,25 +38,37 @@ Clean Architecture 4계층 + DDD + 3개 Bounded Context. 설계 문서의 DDD �
 
 ```
 commerce_agent/
-├── main.py                      # FastAPI 진입점
-├── graph.py                     # LangGraph StateGraph
-├── state.py                     # AgentState TypedDict
-├── nodes/
-│   ├── intent.py                # classify_intent
-│   ├── loaded.py                # check_loaded
-│   ├── sql.py                   # run_sql
-│   ├── ingestion.py             # run_ingestion (IngestionPipeline 실행)
-│   └── responder.py             # generate_response
+├── main.py                      # uvicorn 진입점
+├── agent/
+│   ├── graph.py                 # LangGraph StateGraph 조립 (build_graph, GraphDeps)
+│   ├── state.py                 # AgentState TypedDict
+│   ├── nodes.py                 # 파이프라인 노드 팩토리 (classify_intent ~ generate_response)
+│   └── react_nodes.py           # ReAct 노드 팩토리 + 4개 도구 정의
 ├── pipeline/
 │   ├── base.py                  # Filter ABC, Pipeline
-│   ├── kaggle_loader.py         # KaggleLoadFilter
-│   ├── normalizer.py            # NormalizeFilter (규칙 기반, LLM 불필요)
-│   └── db_writer.py             # UpsertFilter
+│   ├── ingestion.py             # IngestionPipeline (KaggleLoad → Normalize → Upsert)
+│   ├── kaggle_load.py           # KaggleLoadFilter
+│   ├── normalize.py             # NormalizeFilter (규칙 기반, LLM 불필요)
+│   └── upsert.py                # UpsertFilter
+├── api/
+│   ├── app.py                   # FastAPI create_app + lifespan
+│   ├── routes.py                # POST /query, GET /rate
+│   ├── models.py                # QueryRequest, QueryResponse
+│   └── deps.py                  # get_graph, get_exchange_rate
 ├── db/
-│   ├── models.py                # SQLAlchemy 모델
-│   ├── session.py               # DB 세션
-│   └── crud.py                  # upsert / 조회 함수
-└── schemas.py                   # NormalizedProduct Pydantic 모델
+│   ├── models.py                # SQLAlchemy ORM (NormalizedProduct, ProductFact, EvalRun, EvalCase)
+│   ├── session.py               # AsyncSessionLocal
+│   └── currency.py              # INR→KRW 환율 조회
+└── tests/
+    ├── eval/
+    │   ├── golden_set.py        # (query, reference_sql) 쌍
+    │   ├── react_golden_set.py  # ReactGoldenCase (+ expected_tools)
+    │   ├── metrics.py           # check_schema / EX / F1 / grounding_rate / tool_sequence_metrics
+    │   ├── runner.py            # run_eval() — SQL 품질 평가
+    │   └── compare.py           # run_compare_eval() — ReAct vs 파이프라인 비교
+    ├── test_graph.py
+    ├── test_api.py
+    └── test_ingestion_pipeline.py
 ```
 
 ---
@@ -64,19 +76,32 @@ commerce_agent/
 ## 시스템 구조
 
 ```
-User Query
+User Query  { "query": "...", "use_react": false|true }
     ↓
 FastAPI (POST /query)
     ↓
 LangGraph CommerceGraph
     ↓
-[classify_intent]
-    ├─ structured  →  [check_loaded]  ──loaded──→  [run_sql]  →  [generate_response]
-    │                     └──not_loaded──→  [run_ingestion]  →  [run_sql]  →  [generate_response]
-    └─ interpret   →  [check_loaded]  ──loaded──→  [run_sql]  →  [generate_response]
-                            └──not_loaded──→  [run_ingestion]  →  [run_sql]  →  [generate_response]
+[START]
+    ├─ use_react=false (기본) ──────────────────────────────────────────────────────┐
+    │                                                                               │
+    │  [classify_intent] (키워드 매핑)                                              │
+    │      ├─ csv_filename 있음 → [check_loaded]                                    │
+    │      │      ├─ loaded=true  → [run_sql] → [generate_response] → END           │
+    │      │      └─ loaded=false → [run_ingestion] → [run_sql] → [generate_response] → END
+    │      └─ csv_filename 없음 ──────────────────→ [generate_response] → END       │
+    │                                                                               │
+    └─ use_react=true ──────────────────────────────────────────────────────────────┘
+           │
+           ▼
+       [react_reason] ◄────────────────────────────┐
+           │ tool_calls 있음                        │
+           └──► [react_act] ──────────────────────-┘
+           │ tool_calls 없음
+           └──► END
 
 [run_ingestion] = IngestionPipeline(KaggleLoad → Normalize → Upsert)
+[react_act] 사용 가능 도구: search_category / check_db_loaded / ingest_data / query_products
 ```
 
 ---
@@ -88,91 +113,129 @@ LangGraph CommerceGraph
 그래프 전체를 흐르는 공유 상태. 모든 노드는 이 state를 읽고 업데이트한다.
 
 ```python
-from typing import TypedDict, Annotated
-from langgraph.graph.message import add_messages
+# agent/state.py
+from typing import Literal, NotRequired, TypedDict
+
+Intent = Literal["sql", "llm"]
 
 class AgentState(TypedDict):
-    query:        str
-    intent:       str | None          # "structured" | "interpret"
-    category:     str | None          # 정규화된 Kaggle 카테고리명 (classify_intent가 채움)
-    is_loaded:    bool | None         # 해당 카테고리 데이터가 DB에 적재되어 있는가
-    products:     list[dict]          # 적재된 상품 목록 (ingestion 후 채워짐)
-    sql_query:    str | None          # 생성된 SQL
-    sql_results:  list[dict]          # SQL 실행 결과
-    sql_error:    str | None          # Stage 2 retry 실패 시 오류 메시지
-    response:     str | None          # 최종 응답
-    messages:     Annotated[list, add_messages]  # 대화 히스토리
+    # ── 입력 (항상 필수) ──────────────────────────────────────────────
+    query: str
+
+    # ── 경로 선택 ──────────────────────────────────────────────────────
+    use_react: NotRequired[bool]          # True → ReAct, False(기본) → 파이프라인
+
+    # ── 파이프라인 경로 (classify_intent가 채움) ─────────────────────
+    intent: NotRequired[Intent]           # "sql" | "llm"
+    category: NotRequired[str | None]     # 사람이 읽는 카테고리명 (예: "Headphones")
+    csv_filename: NotRequired[str | None] # Kaggle CSV 파일명 (예: "Headphones.csv")
+
+    # ── check_loaded가 채움 ───────────────────────────────────────────
+    data_loaded: NotRequired[bool]        # True → run_sql, False → run_ingestion
+
+    # ── run_sql이 채움 ────────────────────────────────────────────────
+    sql_rows: NotRequired[list[dict]]
+
+    # ── generate_response / react_reason이 채움 ──────────────────────
+    response: NotRequired[str]
+
+    # ── 오류 (어느 노드든) ────────────────────────────────────────────
+    error: NotRequired[str | None]
+
+    # ── ReAct 전용 ────────────────────────────────────────────────────
+    react_messages: NotRequired[list]     # LangChain BaseMessage 목록 (대화 이력)
+    react_iterations: NotRequired[int]    # 무한루프 방지 카운터 (react_act 호출 횟수)
 ```
 
-### 노드 목록
+### 파이프라인 경로 노드
 
 | 노드 | 파일 | 역할 |
 |---|---|---|
-| `classify_intent` | `nodes/intent.py` | LLM으로 질의 유형 분류 |
-| `check_loaded` | `nodes/loaded.py` | 해당 카테고리 데이터가 DB에 적재됐는지 확인 |
-| `run_ingestion` | `nodes/ingestion.py` | IngestionPipeline 실행 |
-| `run_sql` | `nodes/sql.py` | NL→SQL 변환 + 실행 |
-| `generate_response` | `nodes/responder.py` | 최종 응답 생성 |
+| `classify_intent` | `agent/nodes.py` | 키워드 매핑으로 intent/csv_filename 결정 (Phase 2에서 LLM 교체 예정) |
+| `check_loaded` | `agent/nodes.py` | source_site 기준으로 DB에 데이터 존재 여부 확인 |
+| `run_ingestion` | `agent/nodes.py` | IngestionPipeline 실행 (Kaggle CSV → DB upsert) |
+| `run_sql` | `agent/nodes.py` | 키워드 기반 SQL 생성 + 실행 (Phase 2에서 LLM SQL Agent 교체 예정) |
+| `generate_response` | `agent/nodes.py` | sql_rows + query를 받아 LLM으로 자연어 응답 생성 |
 
-`normalize`, `upsert_db`는 LangGraph 노드가 아닌 `IngestionPipeline` 내부 Filter로 처리한다.
+`normalize`, `upsert`는 LangGraph 노드가 아닌 `IngestionPipeline` 내부 Filter로 처리한다.
 
-### 그래프 정의 (`graph.py`)
+### ReAct 경로 노드
+
+| 노드 | 파일 | 역할 |
+|---|---|---|
+| `react_reason` | `agent/react_nodes.py` | LLM이 tool_calls를 결정 (도구 호출 or 최종 답변) |
+| `react_act` | `agent/react_nodes.py` | tool_calls를 실행하고 ToolMessage를 messages에 추가 |
+
+**ReAct에서 LLM에 노출되는 도구 4개:**
+
+| 도구 | 역할 | IO |
+|---|---|---|
+| `search_category` | 키워드 → CSV 파일명 + 카테고리 레이블 | 순수 함수, DB 없음 |
+| `check_db_loaded` | DB에 해당 source_site 데이터가 있는지 확인 | DB SELECT |
+| `ingest_data` | Kaggle CSV 내려받아 DB upsert | Kaggle + DB |
+| `query_products` | 가격·카테고리 조건으로 상품 조회 | DB SELECT |
+
+### 그래프 정의 (`agent/graph.py`)
 
 ```python
-from langgraph.graph import StateGraph, END
-from state import AgentState
-from nodes.intent import make_classify_intent
-from nodes.loaded import make_check_loaded
-from nodes.ingestion import make_run_ingestion
-from nodes.sql import make_run_sql
-from nodes.responder import make_generate_response
-from pipeline.base import Pipeline
-from pipeline.kaggle_loader import KaggleLoadFilter
-from pipeline.normalizer import NormalizeFilter
-from pipeline.db_writer import UpsertFilter
-from db.session import get_session
-import kagglehub
+from langgraph.graph import END, START, StateGraph
+from agent.nodes import (make_check_loaded_node, make_classify_intent_node,
+                          make_generate_response_node, make_run_ingestion_node, make_run_sql_node)
+from agent.react_nodes import make_react_act_node, make_react_reason_node, route_after_react_reason
+from agent.state import AgentState
 
-def route_by_intent(state: AgentState) -> str:
-    return state["intent"]  # "structured" | "interpret"
+def _route_entry(state):          # START 에서 경로 분기
+    return "react_reason" if state.get("use_react") else "classify_intent"
 
-def route_by_loaded(state: AgentState) -> str:
-    return "loaded" if state["is_loaded"] else "not_loaded"
+def _route_after_classify(state): # csv_filename 유무로 DB 경로 결정
+    return "check_loaded" if state.get("csv_filename") else "generate_response"
 
-def build_graph(dataset_path: str, session) -> StateGraph:
-    pipeline = Pipeline([
-        KaggleLoadFilter(dataset_path),
-        NormalizeFilter(),
-        UpsertFilter(session),
-    ])
+def _route_check_loaded(state):
+    return "run_sql" if state.get("data_loaded") else "run_ingestion"
 
-    g = StateGraph(AgentState)
-    g.add_node("classify_intent",   make_classify_intent())
-    g.add_node("check_loaded",      make_check_loaded(session))
-    g.add_node("run_ingestion",     make_run_ingestion(pipeline))
-    g.add_node("run_sql",           make_run_sql(session))
-    g.add_node("generate_response", make_generate_response())
+def build_graph(deps: GraphDeps):
+    workflow = StateGraph(AgentState)
 
-    g.set_entry_point("classify_intent")
+    # 파이프라인 노드
+    workflow.add_node("classify_intent",   make_classify_intent_node())
+    workflow.add_node("check_loaded",      make_check_loaded_node(deps.session_factory))
+    workflow.add_node("run_ingestion",     make_run_ingestion_node(...))
+    workflow.add_node("run_sql",           make_run_sql_node(deps.session_factory, ...))
+    workflow.add_node("generate_response", make_generate_response_node(deps.llm, ...))
 
-    g.add_conditional_edges("classify_intent", route_by_intent, {
-        "structured": "check_loaded",
-        "interpret":  "check_loaded",
-    })
-    g.add_conditional_edges("check_loaded", route_by_loaded, {
-        "loaded":     "run_sql",
-        "not_loaded": "run_ingestion",
-    })
-    g.add_edge("run_ingestion",     "run_sql")
-    g.add_edge("run_sql",           "generate_response")
-    g.add_edge("generate_response", END)
+    # ReAct 노드
+    workflow.add_node("react_reason", make_react_reason_node(deps.llm))
+    workflow.add_node("react_act",    make_react_act_node(...))
 
-    return g.compile()
+    # 진입점: use_react 플래그로 분기
+    workflow.add_conditional_edges(START, _route_entry,
+        {"classify_intent": "classify_intent", "react_reason": "react_reason"})
 
-# FastAPI lifespan에서 호출
-# dataset_path = kagglehub.dataset_download("lokeshparab/amazon-products-dataset")
-# commerce_graph = build_graph(dataset_path, get_session())
+    # 파이프라인 엣지
+    workflow.add_conditional_edges("classify_intent", _route_after_classify, ...)
+    workflow.add_conditional_edges("check_loaded", _route_check_loaded, ...)
+    workflow.add_edge("run_ingestion", "run_sql")
+    workflow.add_edge("run_sql", "generate_response")
+    workflow.add_edge("generate_response", END)
+
+    # ReAct 엣지 (Thought → Act → Observe → Thought 루프)
+    workflow.add_conditional_edges("react_reason", route_after_react_reason,
+        {"react_act": "react_act", "__end__": END})
+    workflow.add_edge("react_act", "react_reason")
+
+    return workflow.compile()
 ```
+
+### 두 경로 비교
+
+| 항목 | 파이프라인 경로 | ReAct 경로 |
+|---|---|---|
+| 진입 | `use_react=false` (기본) | `use_react=true` |
+| 다음 행동 결정 | 하드코딩된 Python 함수 | LLM이 매 스텝 결정 |
+| LLM 호출 횟수 | 1회 (generate_response) | `react_iterations + 1` 회 |
+| SQL 생성 | 키워드 regex → SQL 직접 조립 | `query_products` 도구에 인자 전달 |
+| 예측 가능성 | 높음 (결정론적) | 낮음 (LLM 의존) |
+| 복잡한 쿼리 대응 | 약함 (키워드 미매핑 시 실패) | 강함 (LLM이 추론) |
 
 ---
 
@@ -370,56 +433,46 @@ CREATE TABLE source_provenance (
 
 ## 핵심 노드 설계
 
-### `classify_intent` (`nodes/intent.py`)
+### `classify_intent` (`agent/nodes.py`)
 
-intent 분류와 카테고리 추출을 **한 번의 LLM 호출**로 처리한다.
+**Phase 1: 키워드 매핑 기반** (LLM 호출 없음)
 
 ```python
-from pydantic import BaseModel
-from typing import Literal
-
-# 지원 카테고리 → Kaggle CSV main_category 값 매핑
-CATEGORY_MAP: dict[str, str] = {
-    "headphones": "headphones",   # Phase 1 지원 카테고리
-    # Phase 2+: 추가 Kaggle 데이터셋 카테고리 추가
+# agent/nodes.py — 실제 구현 (Phase 1)
+_CATEGORY_MAP: dict[str, tuple[str, str]] = {
+    "이어폰": ("Headphones.csv", "Headphones"),
+    "헤드폰": ("Headphones.csv", "Headphones"),
+    "스피커": ("Speakers.csv",   "Speakers"),
+    "tv":     ("Televisions.csv", "Televisions"),
+    # ... 30여 개 키워드
 }
+_LLM_KEYWORDS = ("추천", "비교", "어떤", "왜", "설명", "어때", "좋은")
 
-class QueryClassification(BaseModel):
-    intent:   Literal["structured", "interpret"]
-    category: str   # CATEGORY_MAP 키 중 하나, 해당 없으면 "unknown"
+async def classify_intent(state: AgentState) -> dict:
+    q = state["query"].lower()
+    intent = "llm" if any(kw in q for kw in _LLM_KEYWORDS) else "sql"
 
-CLASSIFY_PROMPT = """
-사용자 질의를 분석하여 아래 두 가지를 반환하라.
+    csv_filename, category = None, None
+    for kw, (csv, label) in _CATEGORY_MAP.items():
+        if kw in q:
+            csv_filename, category = csv, label
+            break
 
-intent:
-- structured : 필터·정렬 조건이 명확한 상품 검색 ("5만원 이하 이어폰", "평점 높은 순")
-- interpret  : 추천·비교·설명 요청 ("가성비 좋은 이어폰 추천", "이 둘 차이가 뭐야?")
-
-category: 질의와 관련된 상품 카테고리 (headphones / unknown)
-"""
-
-def make_classify_intent(llm):
-    structured_llm = llm.with_structured_output(QueryClassification)
-
-    async def classify_intent(state: AgentState) -> AgentState:
-        result = await structured_llm.ainvoke([
-            {"role": "system", "content": CLASSIFY_PROMPT},
-            {"role": "user",   "content": state["query"]},
-        ])
-        kaggle_category = CATEGORY_MAP.get(result.category)
-        return {**state, "intent": result.intent, "category": kaggle_category}
-
-    return classify_intent
+    return {"intent": intent, "category": category, "csv_filename": csv_filename}
 ```
 
-| intent | 예시 |
-|---|---|
-| `structured` | "5만원 이하 이어폰", "평점 높은 순 이어폰" |
-| `interpret` | "가성비 좋은 이어폰 추천", "이 둘 차이가 뭐야?" |
+| intent | 예시 | DB 조회 여부 |
+|---|---|---|
+| `sql` | "이어폰 5만원 이하", "스피커 목록" | `csv_filename` 있으면 DB 조회 |
+| `llm` | "이어폰 추천해줘", "어떤 헤드폰이 좋아?" | 동일 (카테고리 키워드 있으면 DB 조회 후 LLM 해석) |
+
+> `intent`(sql/llm)는 응답 스타일만 결정하며, DB 조회 여부는 `csv_filename` 유무로만 결정된다.
+>
+> **Phase 2 예정**: LLM structured output으로 교체해 키워드 미매핑 케이스와 복잡한 쿼리 대응.
 
 > 데이터 소스가 Kaggle 정적 CSV이므로 실시간 재고/가격 조회는 지원하지 않는다.
 
-### `run_sql` (`nodes/sql.py`) — 3단계 점진적 전략
+### `run_sql` (`agent/nodes.py`) — 3단계 점진적 전략
 
 SQL 생성은 품질 지표에 따라 단계적으로 고도화한다.
 
@@ -606,15 +659,43 @@ FROM eval_runs ORDER BY created_at DESC;
 
 ```
 tests/eval/
-├── golden_set.py        # (query, reference_sql) 쌍 10개 이상
-├── metrics.py           # check_schema / execution_accuracy / result_f1 / component_match
-├── runner.py            # run_eval() → EvalSummary + DB 기록
-├── thresholds.py        # StageGate 정의 + check_gates()
-├── test_eval_metrics.py # metrics 단위 테스트 (DB 불필요)
-└── test_eval_runner.py  # runner 단위 테스트 (DB mock)
+├── golden_set.py         # (query, reference_sql) 쌍 10개
+├── react_golden_set.py   # ReactGoldenCase: golden_set + required_tools + optional_tools
+├── metrics.py            # check_schema / EX / F1 / component_match
+│                         # + grounding_rate / category_hit / tool_sequence_metrics  ← 신규
+├── runner.py             # run_eval() → EvalSummary + DB 기록 (SQL 품질 평가)
+├── compare.py            # run_compare_eval() → CompareSummary (ReAct vs 파이프라인)  ← 신규
+├── test_eval_metrics.py  # metrics 단위 테스트 (DB 불필요)
+├── test_eval_runner.py   # runner 단위 테스트 (DB mock)
+└── test_compare.py       # compare 단위 테스트 45개 (DB·LLM 불필요)  ← 신규
 
-eval.py                  # 평가 실행 CLI 진입점
+eval.py                   # 평가 실행 CLI 진입점
 ```
+
+**두 평가 실행기의 역할 분리:**
+
+| 실행기 | 대상 | 핵심 지표 |
+|---|---|---|
+| `run_eval()` | SQL 생성 품질 측정 | schema_invalid_rate, EX, F1, component_match |
+| `run_compare_eval()` | ReAct vs 파이프라인 비교 | category_hit, grounding_rate, tool_recall, llm_calls, latency |
+
+**`run_compare_eval` 측정 지표:**
+
+| 지표 | 두 경로 공통 | ReAct 전용 |
+|---|---|---|
+| `category_hit` | ✓ | |
+| `execution_accuracy` (EX) | ✓ (DB 필요) | |
+| `result_f1` | ✓ (DB 필요) | |
+| `grounding_rate` | ✓ | |
+| `avg_latency_ms` | ✓ | |
+| `avg_llm_calls` | ✓ | |
+| `tool_recall` | | ✓ |
+| `tool_precision` | | ✓ |
+| `unnecessary_ingest_rate` | | ✓ |
+
+**`grounding_rate`와 EX의 차이:**
+- EX: SQL이 올바른 행을 *가져왔는가* (sql_rows ID 집합 비교)
+- grounding_rate: LLM 응답이 가져온 행을 *실제로 반영했는가* (응답 텍스트에 상품명 포함 여부)
 
 측정 결과는 `eval_runs` / `eval_cases` 테이블에 기록되며, 모델 이름(`--model`) 기준으로 시계열 비교가 가능하다.
 
@@ -701,10 +782,23 @@ class NormalizedProduct(BaseModel):
 ## API 엔드포인트
 
 ```
-# Phase 1
+# Phase 1 — 구현 완료
 POST /query
-    body: { "query": "5만원 이하 무선 이어폰 추천해줘" }
-    → commerce_graph.ainvoke({"query": ..., "messages": [...]})
+    body: {
+        "query": "이어폰 5만원 이하",
+        "use_react": false          # true 이면 ReAct 경로, false(기본) 이면 파이프라인 경로
+    }
+    response: {
+        "response": "...",          # LLM 최종 응답
+        "intent": "sql",            # 파이프라인 경로만 채워짐
+        "category": "Headphones",   # 파이프라인 경로만 채워짐
+        "sql_rows": [...],          # DB 조회 결과
+        "error": null,
+        "react_steps": 3            # ReAct 경로의 도구 호출 횟수 (파이프라인은 0)
+    }
+
+GET /rate
+    response: { "inr_to_krw": 16.0 }   # 앱 시작 시 조회한 INR→KRW 환율
 
 # Phase 2
 GET /products
@@ -712,6 +806,18 @@ GET /products
 
 GET /products/{id}
     → 상품 상세 + product_facts
+```
+
+**`use_react` 플래그 동작:**
+
+```
+use_react=false (기본)         use_react=true
+─────────────────────         ────────────────────────────
+classify_intent (키워드)       react_reason (LLM 추론)
+→ check_loaded                → react_act (도구 실행)
+→ run_ingestion?              → react_reason (관찰 후 재추론)
+→ run_sql                     → ... (반복)
+→ generate_response           → 최종 답변
 ```
 
 > `POST /refresh/{id}` (강제 재적재)는 Phase 3 이후 검토. Kaggle 정적 CSV 환경에서는 TTL/freshness 개념이 없으므로 불필요하다.
@@ -1040,27 +1146,31 @@ uv run pytest -m eval                             # 프롬프트 변경 후 수�
 
 ## 구현 순서 (Phase)
 
-### Phase 1 — KISS 구현 (현재 목표)
+### Phase 1 — KISS 구현 ✅ 완료
 
 > 목표: 이어폰 단일 카테고리 end-to-end 동작 확인
 > 적용: FastAPI + LangGraph + IngestionPipeline + SQLAlchemy 직접 호출
 
-- [ ] SQLAlchemy 모델 + Alembic 마이그레이션 (`normalized_products`, `product_facts`)
-- [ ] `Pipeline` + `Filter` ABC (`pipeline/base.py`)
-- [ ] `KaggleLoadFilter` — `kagglehub`으로 CSV 다운로드 + pandas 로드
-- [ ] `NormalizeFilter` — 규칙 기반 CSV 컬럼 파싱 → `NormalizedProduct` (LLM 불필요)
-- [ ] `UpsertFilter` — SQLAlchemy upsert (`source_site`, `source_url` 기준)
-- [ ] `IngestionPipeline` end-to-end 단독 테스트
-- [ ] LangGraph `StateGraph` 기본 골격 + 노드 팩토리 패턴 적용
-- [ ] `classify_intent` + `check_loaded` + `run_ingestion` + `run_sql` + `generate_response`
-- [ ] FastAPI `POST /query` 엔드포인트 연결
-- [ ] `check_loaded` 판단 기준: 해당 카테고리 상품이 DB에 1건 이상 존재하면 loaded
+- [x] SQLAlchemy 모델 + Alembic 마이그레이션 (`normalized_products`, `product_facts`, `eval_runs`, `eval_cases`)
+- [x] `Pipeline` + `Filter` ABC (`pipeline/base.py`)
+- [x] `KaggleLoadFilter` — `kagglehub`으로 CSV 다운로드 + pandas 로드
+- [x] `NormalizeFilter` — 규칙 기반 CSV 컬럼 파싱 → `NormalizedProduct` (LLM 불필요)
+- [x] `UpsertFilter` — SQLAlchemy upsert (`source_site`, `source_url` 기준)
+- [x] `IngestionPipeline` end-to-end 단독 테스트
+- [x] LangGraph `StateGraph` 기본 골격 + 노드 팩토리 패턴 (`agent/graph.py`, `agent/nodes.py`)
+- [x] `classify_intent` + `check_loaded` + `run_ingestion` + `run_sql` + `generate_response`
+- [x] FastAPI `POST /query` + `GET /rate` 엔드포인트
+- [x] SQL 품질 평가 인프라 (`tests/eval/`: golden_set, metrics, runner, EvalRun/EvalCase DB 기록)
+- [x] **ReAct 경로 추가** (`agent/react_nodes.py`, `use_react` 플래그, `react_steps` 응답 필드)
+- [x] **ReAct vs 파이프라인 비교 평가** (`tests/eval/compare.py`, `react_golden_set.py`)
 
 ### Phase 2 — 구조 개선
 
-> 목표: Clean Architecture 레이어 분리, 커버리지 확대
-> 적용: Repository 인터페이스, DI, 멀티턴 대화
+> 목표: classify_intent·run_sql LLM 교체, Clean Architecture 레이어 분리, 커버리지 확대
 
+- [ ] `classify_intent` — LLM structured output으로 교체 (키워드 미매핑 케이스 대응)
+- [ ] `run_sql` — LLM SQL Agent로 교체 (Stage 2: Validator + Retry)
+- [ ] `run_compare_eval`로 ReAct vs 파이프라인 품질·비용 비교 측정 후 기본 경로 결정
 - [ ] `IProductRepository` 인터페이스 도입 + 노드 팩토리에 주입
 - [ ] `interface/`, `application/`, `domain/`, `infrastructure/` 레이어 분리
 - [ ] LangGraph `MemorySaver` — 멀티턴 대화 상태 유지

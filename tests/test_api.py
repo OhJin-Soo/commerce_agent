@@ -146,4 +146,6 @@ class TestGraphInvocation:
 
         await _post(app, "스마트폰 최저가")
 
-        mock_graph.ainvoke.assert_awaited_once_with({"query": "스마트폰 최저가"})
+        mock_graph.ainvoke.assert_awaited_once_with(
+            {"query": "스마트폰 최저가", "use_react": False}
+        )

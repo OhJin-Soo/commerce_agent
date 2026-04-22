@@ -132,3 +132,63 @@ def component_match(ref_sql: str, gen_sql: str) -> dict[str, float]:
 
 def mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+# ---------------------------------------------------------------------------
+# ReAct vs 파이프라인 비교 전용 지표
+# ---------------------------------------------------------------------------
+
+def grounding_rate(response: str, sql_rows: list[dict]) -> float:
+    """sql_rows 상품 중 응답에 이름이 언급된 비율.
+
+    sql_rows 가 비어 있으면 1.0 (측정 불가 → 중립값).
+    응답이 비어 있으면 0.0 (상품 데이터를 전혀 반영하지 않음).
+
+    sql_rows 의 최대 10개까지만 비교한다 (generate_response 가 10개 제한을 두므로).
+    """
+    if not sql_rows:
+        return 1.0
+    if not response:
+        return 0.0
+    candidates = sql_rows[:10]
+    resp_lower = response.lower()
+    mentioned = sum(
+        1 for row in candidates
+        if (name := row.get("name", "")) and name.lower() in resp_lower
+    )
+    return mentioned / len(candidates)
+
+
+def category_hit(expected_csv: str | None, actual_csv: str | None) -> bool:
+    """두 경로가 동일한 CSV 파일(카테고리)을 선택했는가.
+
+    둘 다 None 이면 True (카테고리 없는 쿼리를 올바르게 처리함).
+    """
+    return expected_csv == actual_csv
+
+
+def tool_sequence_metrics(
+    required_tools: list[str],
+    optional_tools: list[str],
+    actual_tools: list[str],
+) -> dict[str, float]:
+    """ReAct 도구 호출의 정밀도(precision)와 재현율(recall)을 계산한다.
+
+    precision : 실제 호출한 도구 중 예상(required+optional) 도구 비율
+                → 낮으면 불필요한 도구를 호출한 것
+    recall    : required 도구 중 실제 호출된 비율
+                → 낮으면 필수 도구를 빠뜨린 것
+
+    Args:
+        required_tools: 반드시 호출해야 할 도구 목록
+        optional_tools: 상황에 따라 호출될 수 있는 도구 목록
+        actual_tools:   실제로 호출된 도구 목록 (중복 포함 가능)
+    """
+    required = set(required_tools)
+    allowed = required | set(optional_tools)
+    actual = set(actual_tools)          # 중복 제거 후 집합 비교
+
+    recall = len(required & actual) / len(required) if required else 1.0
+    precision = len(actual & allowed) / len(actual) if actual else 1.0
+
+    return {"tool_recall": recall, "tool_precision": precision}
