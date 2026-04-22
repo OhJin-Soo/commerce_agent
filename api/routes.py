@@ -18,18 +18,24 @@ router = APIRouter()
     summary="상품 검색 / 추천 쿼리",
     description=(
         "자연어 쿼리를 받아 LangGraph 에이전트를 실행한다.\n\n"
+        "**파이프라인 경로** (`use_react=false`, 기본)\n"
         "- 구조적 질문(`이어폰 5만원 이하`) → DB SQL 조회\n"
         "- 추천·해석 질문(`이어폰 추천해줘`) → LLM 응답\n"
-        "- 데이터 미적재 시 Kaggle 자동 인제스트 후 SQL 조회"
+        "- 데이터 미적재 시 Kaggle 자동 인제스트 후 SQL 조회\n\n"
+        "**ReAct 경로** (`use_react=true`)\n"
+        "- LLM이 Thought→Act→Observe 루프로 도구를 직접 선택·실행\n"
+        "- 응답의 `react_steps` 필드에서 도구 호출 횟수 확인 가능"
     ),
 )
 async def query_endpoint(
     body: QueryRequest,
     graph=Depends(get_graph),
 ) -> QueryResponse:
-    logger.info("POST /query  query=%r", body.query)
+    logger.info("POST /query  query=%r  use_react=%s", body.query, body.use_react)
     try:
-        result: dict = await graph.ainvoke({"query": body.query})
+        result: dict = await graph.ainvoke(
+            {"query": body.query, "use_react": body.use_react}
+        )
     except Exception as exc:
         logger.exception("graph.ainvoke failed")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -40,6 +46,7 @@ async def query_endpoint(
         category=result.get("category"),
         sql_rows=result.get("sql_rows", []),
         error=result.get("error"),
+        react_steps=result.get("react_iterations", 0),
     )
 
 
