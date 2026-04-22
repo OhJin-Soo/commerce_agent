@@ -1,7 +1,7 @@
 """POST /query 엔드포인트 테스트.
 
 실제 DB·LLM·Kaggle 없이 단독 실행 가능:
-- app.state.graph 를 Mock 으로 교체해 FastAPI 레이어만 검증한다.
+- app.state.graphs 를 Mock 으로 교체해 FastAPI 레이어만 검증한다.
 """
 from __future__ import annotations
 
@@ -12,29 +12,30 @@ from httpx import ASGITransport, AsyncClient
 
 from api.app import create_app
 
+DEFAULT_MODEL = "llama3.1:8b"
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
-def _make_app(graph_result: dict):
-    """graph.ainvoke() 가 지정된 결과를 반환하는 테스트용 FastAPI 앱."""
+def _make_app(graph_result: dict, model: str = DEFAULT_MODEL):
+    """graphs[model].ainvoke() 가 지정된 결과를 반환하는 테스트용 FastAPI 앱."""
     app = create_app()
 
     mock_graph = MagicMock()
     mock_graph.ainvoke = AsyncMock(return_value=graph_result)
-    app.state.graph = mock_graph
+    app.state.graphs = {model: mock_graph}
 
-    # lifespan 이 graph 를 덮어쓰지 않도록 이미 설정된 state 를 유지
-    # (lifespan 은 실제 구동 시에만 실행되므로 TestClient 에서는 별도 처리 불필요)
     return app
 
 
-async def _post(app, query: str) -> tuple[int, dict]:
+async def _post(app, query: str, **extra) -> tuple[int, dict]:
+    payload = {"query": query, **extra}
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
-        resp = await client.post("/query", json={"query": query})
+        resp = await client.post("/query", json=payload)
     return resp.status_code, resp.json()
 
 
@@ -92,6 +93,13 @@ class TestQueryEndpoint:
         assert body["error"] == "DB 연결 실패"
         assert body["sql_rows"] == []
 
+    async def test_model_echoed_in_response(self):
+        """요청의 model 이 응답의 model 필드로 그대로 반환된다."""
+        app = _make_app({"intent": "sql", "response": "ok", "sql_rows": []})
+        status, body = await _post(app, "노트북", model=DEFAULT_MODEL)
+        assert status == 200
+        assert body["model"] == DEFAULT_MODEL
+
 
 # ---------------------------------------------------------------------------
 # 입력 유효성 검사
@@ -124,7 +132,7 @@ class TestGraphException:
         app = create_app()
         mock_graph = MagicMock()
         mock_graph.ainvoke = AsyncMock(side_effect=RuntimeError("내부 오류"))
-        app.state.graph = mock_graph
+        app.state.graphs = {DEFAULT_MODEL: mock_graph}
 
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
@@ -136,13 +144,55 @@ class TestGraphException:
 
 
 # ---------------------------------------------------------------------------
+# 모델 라우팅
+# ---------------------------------------------------------------------------
+
+class TestModelRouting:
+    async def test_unknown_model_returns_400(self):
+        """등록되지 않은 모델을 요청하면 HTTP 400 을 반환한다."""
+        app = _make_app({}, model=DEFAULT_MODEL)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/query", json={"query": "이어폰", "model": "unknown-model:latest"}
+            )
+        assert resp.status_code == 400
+
+    async def test_second_model_routed_correctly(self):
+        """두 번째 모델로 요청하면 해당 그래프가 호출된다."""
+        app = create_app()
+        mock_llama = MagicMock()
+        mock_llama.ainvoke = AsyncMock(return_value={"response": "llama", "sql_rows": []})
+        mock_deepseek = MagicMock()
+        mock_deepseek.ainvoke = AsyncMock(return_value={"response": "deepseek", "sql_rows": []})
+        app.state.graphs = {
+            "llama3.1:8b": mock_llama,
+            "deepseek-r1:8b": mock_deepseek,
+        }
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/query", json={"query": "이어폰", "model": "deepseek-r1:8b"}
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["response"] == "deepseek"
+        mock_deepseek.ainvoke.assert_awaited_once()
+        mock_llama.ainvoke.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # graph.ainvoke 호출 인자 검증
 # ---------------------------------------------------------------------------
 
 class TestGraphInvocation:
     async def test_query_forwarded_to_graph(self):
         app = _make_app({"intent": "sql", "response": "ok", "sql_rows": []})
-        mock_graph = app.state.graph
+        mock_graph = app.state.graphs[DEFAULT_MODEL]
 
         await _post(app, "스마트폰 최저가")
 

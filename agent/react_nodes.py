@@ -253,7 +253,8 @@ def make_react_reason_node(llm):  # type: ignore[type-arg]
 
         # 도구 호출 없음 → 최종 답변
         logger.info("react_reason [iter=%d]: 최종 답변 생성", iterations)
-        return {"react_messages": messages, "response": ai_msg.content}
+        from agent.utils import strip_thinking
+        return {"react_messages": messages, "response": strip_thinking(ai_msg.content)}
 
     return react_reason
 

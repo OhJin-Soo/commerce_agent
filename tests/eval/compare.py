@@ -445,3 +445,92 @@ async def run_compare_eval(
         react=react_agg,
         cases=compare_cases,
     )
+
+
+# ---------------------------------------------------------------------------
+# 모델 비교 전용 자료구조 및 실행 함수
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModelCompareSummary:
+    """여러 모델의 비교 평가 결과를 묶는 컨테이너.
+
+    summaries: model_name → CompareSummary 매핑
+    use_react:  True 면 ReAct 경로, False 면 파이프라인 경로로 평가
+    """
+    summaries: dict[str, CompareSummary] = field(default_factory=dict)
+    use_react: bool = False
+
+    def best_model(self, metric: str = "grounding_rate") -> str | None:
+        """지정한 지표가 가장 높은 모델 이름을 반환한다.
+
+        metric: 'grounding_rate' | 'category_hit_rate' | 'execution_accuracy' |
+                'result_f1' | 'tool_recall' | 'tool_precision'
+        """
+        if not self.summaries:
+            return None
+
+        def _get(summary: CompareSummary) -> float:
+            agg = summary.react if self.use_react else summary.pipeline
+            return getattr(agg, metric, 0.0)
+
+        return max(self.summaries, key=lambda name: _get(self.summaries[name]))
+
+    def __str__(self) -> str:
+        path_label = "react" if self.use_react else "pipeline"
+        lines = [f"=== ModelCompareSummary (path={path_label}) ===", ""]
+        for name, summary in self.summaries.items():
+            agg = summary.react if self.use_react else summary.pipeline
+            db_note = "" if summary.has_db_eval else "  ※ EX/F1 미측정"
+            lines.append(f"  [{name}]{db_note}")
+            lines.append(
+                f"    category_hit={agg.category_hit_rate:.1%}"
+                f"  grounding={agg.grounding_rate:.1%}"
+                f"  EX={agg.execution_accuracy:.1%}"
+                f"  F1={agg.result_f1:.1%}"
+                f"  latency={agg.avg_latency_ms:.0f}ms"
+                f"  llm_calls={agg.avg_llm_calls:.1f}"
+            )
+            if self.use_react:
+                lines.append(
+                    f"    tool_recall={agg.tool_recall:.1%}"
+                    f"  tool_precision={agg.tool_precision:.1%}"
+                    f"  unnecessary_ingest={agg.unnecessary_ingest_rate:.1%}"
+                )
+            lines.append("")
+        best = self.best_model()
+        if best:
+            lines.append(f"  ★ Best (grounding_rate): {best}")
+        return "\n".join(lines)
+
+
+async def run_model_compare_eval(
+    graphs: dict,
+    cases: list[ReactGoldenCase],
+    use_react: bool = False,
+    session_factory: async_sessionmaker | None = None,
+) -> ModelCompareSummary:
+    """여러 모델을 동일한 케이스로 평가하고 ModelCompareSummary 를 반환한다.
+
+    Args:
+        graphs:          {model_name: compiled_graph} 딕셔너리
+        cases:           REACT_GOLDEN_SET (또는 그 부분집합)
+        use_react:       True 면 ReAct 경로로만 평가, False 면 파이프라인 경로로만 평가
+        session_factory: 제공하면 reference SQL 을 실행해 EX/F1 계산, None 이면 생략
+
+    각 모델에 대해 run_compare_eval 을 순차 실행하므로, 케이스 수가 많으면
+    시간이 오래 걸릴 수 있다.
+    """
+    summaries: dict[str, CompareSummary] = {}
+
+    for model_name, graph in graphs.items():
+        logger.info("model_compare_eval: 모델=%s  use_react=%s", model_name, use_react)
+        summary = await run_compare_eval(
+            graph=graph,
+            cases=cases,
+            session_factory=session_factory,
+            model_name=model_name,
+        )
+        summaries[model_name] = summary
+
+    return ModelCompareSummary(summaries=summaries, use_react=use_react)

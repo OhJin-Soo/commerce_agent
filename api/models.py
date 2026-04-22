@@ -12,6 +12,10 @@ class QueryRequest(BaseModel):
             "False(기본): 키워드 기반 결정론적 파이프라인 경로."
         ),
     )
+    model: str = Field(
+        "llama3.1:8b",
+        description="사용할 Ollama 모델 이름 (예: 'llama3.1:8b', 'deepseek-r1:8b').",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -22,3 +26,4 @@ class QueryResponse(BaseModel):
     error: str | None = None
     # ReAct 경로 전용: LLM이 도구를 몇 번 호출했는지 (파이프라인 경로에서는 0)
     react_steps: int = 0
+    model: str = ""

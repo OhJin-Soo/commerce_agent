@@ -310,7 +310,8 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
         ]
         try:
             ai_msg = await llm.ainvoke(messages)
-            return {"response": ai_msg.content}
+            from agent.utils import strip_thinking
+            return {"response": strip_thinking(ai_msg.content)}
         except Exception as exc:
             logger.error("generate_response failed: %s", exc)
             return {"response": "", "error": str(exc)}

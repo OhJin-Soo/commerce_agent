@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from tests.eval.compare import (
     CompareCase,
+    ModelCompareSummary,
     PathMetrics,
     PathResult,
     _compute_metrics,
@@ -16,6 +17,7 @@ from tests.eval.compare import (
     _extract_tool_sequence,
     _was_ingest_unnecessary,
     run_compare_eval,
+    run_model_compare_eval,
 )
 from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics
 from tests.eval.react_golden_set import REACT_GOLDEN_SET, ReactGoldenCase
@@ -420,6 +422,67 @@ class TestRunCompareEval:
         assert "avg_llm_calls"         in out
         assert "tool_recall"           in out
         assert "unnecessary_ingest"    in out
+
+
+# ---------------------------------------------------------------------------
+# run_model_compare_eval
+# ---------------------------------------------------------------------------
+
+def _make_multi_model_graphs(csv: str = "Headphones.csv"):
+    """두 모델에 대한 mock 그래프 딕셔너리를 반환한다."""
+    results = {}
+    for model in ("llama3.1:8b", "deepseek-r1:8b"):
+        pipeline_state = {"sql_rows": [], "response": f"{model} 파이프라인", "csv_filename": csv}
+        react_state = {
+            "sql_rows": [], "response": f"{model} ReAct",
+            "react_messages": _make_tool_msgs(csv, loaded=True),
+            "react_iterations": 2,
+        }
+        ainvoke = AsyncMock(side_effect=lambda state, p=pipeline_state, r=react_state: (
+            r if state.get("use_react") else p
+        ))
+        g = MagicMock()
+        g.ainvoke = ainvoke
+        results[model] = g
+    return results
+
+
+class TestRunModelCompareEval:
+    async def test_returns_model_compare_summary(self):
+        graphs = _make_multi_model_graphs()
+        result = await run_model_compare_eval(graphs, REACT_GOLDEN_SET[:1], use_react=False)
+        assert isinstance(result, ModelCompareSummary)
+        assert set(result.summaries.keys()) == {"llama3.1:8b", "deepseek-r1:8b"}
+
+    async def test_all_models_evaluated(self):
+        graphs = _make_multi_model_graphs()
+        result = await run_model_compare_eval(graphs, REACT_GOLDEN_SET[:2], use_react=False)
+        for name, summary in result.summaries.items():
+            assert summary.n == 2, f"{name}: n={summary.n} (expected 2)"
+
+    async def test_best_model_returned(self):
+        """best_model 은 지정 지표가 가장 높은 모델을 반환한다."""
+        graphs = _make_multi_model_graphs()
+        result = await run_model_compare_eval(graphs, REACT_GOLDEN_SET[:1], use_react=False)
+        best = result.best_model("grounding_rate")
+        assert best in {"llama3.1:8b", "deepseek-r1:8b"}
+
+    async def test_best_model_empty_summaries(self):
+        result = ModelCompareSummary(summaries={}, use_react=False)
+        assert result.best_model() is None
+
+    async def test_use_react_flag_propagated(self):
+        graphs = _make_multi_model_graphs()
+        result = await run_model_compare_eval(graphs, REACT_GOLDEN_SET[:1], use_react=True)
+        assert result.use_react is True
+
+    async def test_str_contains_model_names(self):
+        graphs = _make_multi_model_graphs()
+        result = await run_model_compare_eval(graphs, REACT_GOLDEN_SET[:1], use_react=False)
+        out = str(result)
+        assert "llama3.1:8b"    in out
+        assert "deepseek-r1:8b" in out
+        assert "grounding"      in out
 
 
 # ---------------------------------------------------------------------------

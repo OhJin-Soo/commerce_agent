@@ -2,14 +2,32 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from api.deps import get_exchange_rate, get_graph
+from api.deps import get_exchange_rate
 from api.models import QueryRequest, QueryResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _resolve_graph(request: Request, model: str):
+    """app.state.graphs[model] 또는 app.state.graph 를 반환한다."""
+    graphs: dict = getattr(request.app.state, "graphs", None) or {}
+    if graphs:
+        if model not in graphs:
+            available = list(graphs.keys())
+            raise HTTPException(
+                status_code=400,
+                detail=f"모델 '{model}'을 찾을 수 없습니다. 사용 가능한 모델: {available}",
+            )
+        return graphs[model]
+    # 하위 호환: 단일 그래프 모드 (테스트 및 레거시 배포)
+    graph = getattr(request.app.state, "graph", None)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="그래프가 초기화되지 않았습니다.")
+    return graph
 
 
 @router.post(
@@ -24,14 +42,20 @@ router = APIRouter()
         "- 데이터 미적재 시 Kaggle 자동 인제스트 후 SQL 조회\n\n"
         "**ReAct 경로** (`use_react=true`)\n"
         "- LLM이 Thought→Act→Observe 루프로 도구를 직접 선택·실행\n"
-        "- 응답의 `react_steps` 필드에서 도구 호출 횟수 확인 가능"
+        "- 응답의 `react_steps` 필드에서 도구 호출 횟수 확인 가능\n\n"
+        "**모델 선택** (`model` 필드)\n"
+        "- `llama3.1:8b` (기본) 또는 `deepseek-r1:8b` 등 서버에 로드된 모델 지정"
     ),
 )
 async def query_endpoint(
+    request: Request,
     body: QueryRequest,
-    graph=Depends(get_graph),
 ) -> QueryResponse:
-    logger.info("POST /query  query=%r  use_react=%s", body.query, body.use_react)
+    graph = _resolve_graph(request, body.model)
+    logger.info(
+        "POST /query  query=%r  use_react=%s  model=%s",
+        body.query, body.use_react, body.model,
+    )
     try:
         result: dict = await graph.ainvoke(
             {"query": body.query, "use_react": body.use_react}
@@ -47,6 +71,7 @@ async def query_endpoint(
         sql_rows=result.get("sql_rows", []),
         error=result.get("error"),
         react_steps=result.get("react_iterations", 0),
+        model=body.model,
     )
 
 
