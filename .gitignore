@@ -5,12 +5,13 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code setting
+.claude/
 
 # Environment variables (contains secrets)
 .env

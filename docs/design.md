@@ -39,11 +39,13 @@ Clean Architecture 4계층 + DDD + 3개 Bounded Context. 설계 문서의 DDD �
 ```
 commerce_agent/
 ├── main.py                      # uvicorn 진입점
+├── eval.py                      # SQL 품질 평가 CLI
 ├── agent/
 │   ├── graph.py                 # LangGraph StateGraph 조립 (build_graph, GraphDeps)
 │   ├── state.py                 # AgentState TypedDict
-│   ├── nodes.py                 # 파이프라인 노드 팩토리 (classify_intent ~ generate_response)
-│   └── react_nodes.py           # ReAct 노드 팩토리 + 4개 도구 정의
+│   ├── nodes.py                 # 파이프라인 노드 팩토리 (classify_intent ~ web_search ~ generate_response)
+│   ├── react_nodes.py           # ReAct 노드 팩토리 + 5개 도구 정의
+│   └── utils.py                 # 공용 유틸 (strip_thinking)
 ├── pipeline/
 │   ├── base.py                  # Filter ABC, Pipeline
 │   ├── ingestion.py             # IngestionPipeline (KaggleLoad → Normalize → Upsert)
@@ -51,10 +53,10 @@ commerce_agent/
 │   ├── normalize.py             # NormalizeFilter (규칙 기반, LLM 불필요)
 │   └── upsert.py                # UpsertFilter
 ├── api/
-│   ├── app.py                   # FastAPI create_app + lifespan
+│   ├── app.py                   # FastAPI create_app + lifespan (멀티 모델 지원)
 │   ├── routes.py                # POST /query, GET /rate
-│   ├── models.py                # QueryRequest, QueryResponse
-│   └── deps.py                  # get_graph, get_exchange_rate
+│   ├── models.py                # QueryRequest (model 필드 포함), QueryResponse
+│   └── deps.py                  # get_exchange_rate
 ├── db/
 │   ├── models.py                # SQLAlchemy ORM (NormalizedProduct, ProductFact, EvalRun, EvalCase)
 │   ├── session.py               # AsyncSessionLocal
@@ -65,7 +67,7 @@ commerce_agent/
     │   ├── react_golden_set.py  # ReactGoldenCase (+ expected_tools)
     │   ├── metrics.py           # check_schema / EX / F1 / grounding_rate / tool_sequence_metrics
     │   ├── runner.py            # run_eval() — SQL 품질 평가
-    │   └── compare.py           # run_compare_eval() — ReAct vs 파이프라인 비교
+    │   └── compare.py           # run_compare_eval() / run_model_compare_eval() — 경로·모델 비교
     ├── test_graph.py
     ├── test_api.py
     └── test_ingestion_pipeline.py
@@ -76,9 +78,9 @@ commerce_agent/
 ## 시스템 구조
 
 ```
-User Query  { "query": "...", "use_react": false|true }
+User Query  { "query": "...", "use_react": false|true, "model": "llama3.1:8b" }
     ↓
-FastAPI (POST /query)
+FastAPI (POST /query)  — app.state.graphs[model] 로 그래프 선택
     ↓
 LangGraph CommerceGraph
     ↓
@@ -86,6 +88,7 @@ LangGraph CommerceGraph
     ├─ use_react=false (기본) ──────────────────────────────────────────────────────┐
     │                                                                               │
     │  [classify_intent] (키워드 매핑)                                              │
+    │      ├─ intent=web_search → [web_search] (Tavily) → [generate_response] → END │
     │      ├─ csv_filename 있음 → [check_loaded]                                    │
     │      │      ├─ loaded=true  → [run_sql] → [generate_response] → END           │
     │      │      └─ loaded=false → [run_ingestion] → [run_sql] → [generate_response] → END
@@ -101,7 +104,7 @@ LangGraph CommerceGraph
            └──► END
 
 [run_ingestion] = IngestionPipeline(KaggleLoad → Normalize → Upsert)
-[react_act] 사용 가능 도구: search_category / check_db_loaded / ingest_data / query_products
+[react_act] 사용 가능 도구: search_category / check_db_loaded / ingest_data / query_products / search_web
 ```
 
 ---
@@ -116,7 +119,10 @@ LangGraph CommerceGraph
 # agent/state.py
 from typing import Literal, NotRequired, TypedDict
 
-Intent = Literal["sql", "llm"]
+Intent = Literal["sql", "llm", "web_search"]
+#   "sql"        → check_loaded → (run_ingestion →) run_sql → generate_response
+#   "llm"        → generate_response  (카테고리 키워드 없으면 LLM 직행)
+#   "web_search" → web_search (Tavily) → generate_response
 
 class AgentState(TypedDict):
     # ── 입력 (항상 필수) ──────────────────────────────────────────────
@@ -126,7 +132,7 @@ class AgentState(TypedDict):
     use_react: NotRequired[bool]          # True → ReAct, False(기본) → 파이프라인
 
     # ── 파이프라인 경로 (classify_intent가 채움) ─────────────────────
-    intent: NotRequired[Intent]           # "sql" | "llm"
+    intent: NotRequired[Intent]           # "sql" | "llm" | "web_search"
     category: NotRequired[str | None]     # 사람이 읽는 카테고리명 (예: "Headphones")
     csv_filename: NotRequired[str | None] # Kaggle CSV 파일명 (예: "Headphones.csv")
 
@@ -135,6 +141,9 @@ class AgentState(TypedDict):
 
     # ── run_sql이 채움 ────────────────────────────────────────────────
     sql_rows: NotRequired[list[dict]]
+
+    # ── web_search 노드가 채움 ────────────────────────────────────────
+    web_results: NotRequired[list[dict]]  # [{title, url, content}, ...]
 
     # ── generate_response / react_reason이 채움 ──────────────────────
     response: NotRequired[str]
@@ -152,10 +161,11 @@ class AgentState(TypedDict):
 | 노드 | 파일 | 역할 |
 |---|---|---|
 | `classify_intent` | `agent/nodes.py` | 키워드 매핑으로 intent/csv_filename 결정 (Phase 2에서 LLM 교체 예정) |
+| `web_search` | `agent/nodes.py` | Tavily API로 웹 검색, 결과를 `web_results`에 저장 (`web_search` 인텐트 전용) |
 | `check_loaded` | `agent/nodes.py` | source_site 기준으로 DB에 데이터 존재 여부 확인 |
 | `run_ingestion` | `agent/nodes.py` | IngestionPipeline 실행 (Kaggle CSV → DB upsert) |
 | `run_sql` | `agent/nodes.py` | 키워드 기반 SQL 생성 + 실행 (Phase 2에서 LLM SQL Agent 교체 예정) |
-| `generate_response` | `agent/nodes.py` | sql_rows + query를 받아 LLM으로 자연어 응답 생성 |
+| `generate_response` | `agent/nodes.py` | `web_results` > `sql_rows` 순 우선순위로 컨텍스트를 구성해 LLM 응답 생성 |
 
 `normalize`, `upsert`는 LangGraph 노드가 아닌 `IngestionPipeline` 내부 Filter로 처리한다.
 
@@ -166,7 +176,7 @@ class AgentState(TypedDict):
 | `react_reason` | `agent/react_nodes.py` | LLM이 tool_calls를 결정 (도구 호출 or 최종 답변) |
 | `react_act` | `agent/react_nodes.py` | tool_calls를 실행하고 ToolMessage를 messages에 추가 |
 
-**ReAct에서 LLM에 노출되는 도구 4개:**
+**ReAct에서 LLM에 노출되는 도구 5개:**
 
 | 도구 | 역할 | IO |
 |---|---|---|
@@ -174,20 +184,24 @@ class AgentState(TypedDict):
 | `check_db_loaded` | DB에 해당 source_site 데이터가 있는지 확인 | DB SELECT |
 | `ingest_data` | Kaggle CSV 내려받아 DB upsert | Kaggle + DB |
 | `query_products` | 가격·카테고리 조건으로 상품 조회 | DB SELECT |
+| `search_web` | Tavily로 웹 검색 — 리뷰·후기 등 비정형 외부 정보 수집 | Tavily API |
 
 ### 그래프 정의 (`agent/graph.py`)
 
 ```python
 from langgraph.graph import END, START, StateGraph
 from agent.nodes import (make_check_loaded_node, make_classify_intent_node,
-                          make_generate_response_node, make_run_ingestion_node, make_run_sql_node)
+                          make_generate_response_node, make_run_ingestion_node,
+                          make_run_sql_node, make_web_search_node)
 from agent.react_nodes import make_react_act_node, make_react_reason_node, route_after_react_reason
 from agent.state import AgentState
 
 def _route_entry(state):          # START 에서 경로 분기
     return "react_reason" if state.get("use_react") else "classify_intent"
 
-def _route_after_classify(state): # csv_filename 유무로 DB 경로 결정
+def _route_after_classify(state):
+    if state.get("intent") == "web_search":
+        return "web_search"       # Tavily 검색 경로
     return "check_loaded" if state.get("csv_filename") else "generate_response"
 
 def _route_check_loaded(state):
@@ -198,6 +212,7 @@ def build_graph(deps: GraphDeps):
 
     # 파이프라인 노드
     workflow.add_node("classify_intent",   make_classify_intent_node())
+    workflow.add_node("web_search",        make_web_search_node(deps.tavily_api_key))
     workflow.add_node("check_loaded",      make_check_loaded_node(deps.session_factory))
     workflow.add_node("run_ingestion",     make_run_ingestion_node(...))
     workflow.add_node("run_sql",           make_run_sql_node(deps.session_factory, ...))
@@ -205,14 +220,16 @@ def build_graph(deps: GraphDeps):
 
     # ReAct 노드
     workflow.add_node("react_reason", make_react_reason_node(deps.llm))
-    workflow.add_node("react_act",    make_react_act_node(...))
+    workflow.add_node("react_act",    make_react_act_node(..., tavily_api_key=deps.tavily_api_key))
 
     # 진입점: use_react 플래그로 분기
     workflow.add_conditional_edges(START, _route_entry,
         {"classify_intent": "classify_intent", "react_reason": "react_reason"})
 
     # 파이프라인 엣지
-    workflow.add_conditional_edges("classify_intent", _route_after_classify, ...)
+    workflow.add_conditional_edges("classify_intent", _route_after_classify,
+        {"web_search": "web_search", "check_loaded": "check_loaded", "generate_response": "generate_response"})
+    workflow.add_edge("web_search", "generate_response")           # Tavily → 응답 생성
     workflow.add_conditional_edges("check_loaded", _route_check_loaded, ...)
     workflow.add_edge("run_ingestion", "run_sql")
     workflow.add_edge("run_sql", "generate_response")
@@ -446,11 +463,19 @@ _CATEGORY_MAP: dict[str, tuple[str, str]] = {
     "tv":     ("Televisions.csv", "Televisions"),
     # ... 30여 개 키워드
 }
+# 우선순위: web_search > llm > sql
+_WEB_SEARCH_KEYWORDS = ("리뷰", "후기", "평가", "의견", "평판", "사람들", "실사용", "사용기")
 _LLM_KEYWORDS = ("추천", "비교", "어떤", "왜", "설명", "어때", "좋은")
 
 async def classify_intent(state: AgentState) -> dict:
     q = state["query"].lower()
-    intent = "llm" if any(kw in q for kw in _LLM_KEYWORDS) else "sql"
+
+    if any(kw in q for kw in _WEB_SEARCH_KEYWORDS):
+        intent = "web_search"
+    elif any(kw in q for kw in _LLM_KEYWORDS):
+        intent = "llm"
+    else:
+        intent = "sql"
 
     csv_filename, category = None, None
     for kw, (csv, label) in _CATEGORY_MAP.items():
@@ -461,12 +486,15 @@ async def classify_intent(state: AgentState) -> dict:
     return {"intent": intent, "category": category, "csv_filename": csv_filename}
 ```
 
-| intent | 예시 | DB 조회 여부 |
+| intent | 예시 | 다음 노드 |
 |---|---|---|
-| `sql` | "이어폰 5만원 이하", "스피커 목록" | `csv_filename` 있으면 DB 조회 |
-| `llm` | "이어폰 추천해줘", "어떤 헤드폰이 좋아?" | 동일 (카테고리 키워드 있으면 DB 조회 후 LLM 해석) |
+| `web_search` | "Sony WH-1000XM5 리뷰", "이어폰 사람들 평가" | `web_search` (Tavily) → `generate_response` |
+| `sql` | "이어폰 5만원 이하", "스피커 목록" | `check_loaded` → `run_sql` → `generate_response` |
+| `llm` | "이어폰 추천해줘", "어떤 헤드폰이 좋아?" | `check_loaded`(csv 있는 경우) → `generate_response` |
 
-> `intent`(sql/llm)는 응답 스타일만 결정하며, DB 조회 여부는 `csv_filename` 유무로만 결정된다.
+> - `web_search` 인텐트는 DB를 조회하지 않고 Tavily 웹 검색으로 비정형 외부 정보를 수집한다.
+> - `intent`(sql/llm)는 응답 스타일만 결정하며, DB 조회 여부는 `csv_filename` 유무로 결정된다.
+> - `TAVILY_API_KEY`가 없으면 `web_results=[]`로 graceful degradation 후 LLM이 자체 지식으로 응답한다.
 >
 > **Phase 2 예정**: LLM structured output으로 교체해 키워드 미매핑 케이스와 복잡한 쿼리 대응.
 
