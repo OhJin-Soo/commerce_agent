@@ -48,6 +48,7 @@ from agent.nodes import (
     make_generate_response_node,
     make_run_ingestion_node,
     make_run_sql_node,
+    make_web_search_node,
 )
 from agent.react_nodes import (
     make_react_act_node,
@@ -69,6 +70,7 @@ class GraphDeps:
     ingest_source_site: str = "kaggle/amazon-products"
     ingest_nrows: int | None = None    # None = 전체, 정수 = 행 수 제한
     exchange_rate: float = 16.0        # INR → KRW 환율 (앱 시작 시 실시간 갱신)
+    tavily_api_key: str | None = None  # Tavily 검색 API 키 (없으면 web_search 경로 비활성)
 
 
 # ---------------------------------------------------------------------------
@@ -76,11 +78,14 @@ class GraphDeps:
 # ---------------------------------------------------------------------------
 
 def _route_after_classify(state: AgentState) -> str:
-    """csv_filename 이 있으면 DB 경로, 없으면 LLM 직행.
+    """인텐트와 csv_filename 에 따라 다음 노드를 결정한다.
 
-    intent(sql/llm)는 응답 스타일을 결정할 뿐 DB 조회 여부와 무관하다.
-    카테고리 키워드가 없는 쿼리("커머스 사용법 알려줘" 등)만 DB를 건너뛴다.
+    - web_search 인텐트 → web_search 노드 (Tavily 호출)
+    - csv_filename 있음  → check_loaded (DB 조회 경로)
+    - csv_filename 없음  → generate_response (LLM 직행)
     """
+    if state.get("intent") == "web_search":
+        return "web_search"
     return "check_loaded" if state.get("csv_filename") else "generate_response"
 
 
@@ -106,19 +111,21 @@ def build_graph(deps: GraphDeps):
     토폴로지::
 
         START
-          ├── use_react=False → classify_intent (파이프라인 경로, 기존)
+          ├── use_react=False → classify_intent (파이프라인 경로)
+          │     ├── intent=web_search → web_search (Tavily) → generate_response → END
           │     ├── csv_filename 있음 → check_loaded
           │     │     ├── loaded=True  → run_sql → generate_response → END
           │     │     └── loaded=False → run_ingestion → run_sql → generate_response → END
-          │     └── csv_filename 없음 ──────────────────► generate_response → END
+          │     └── csv_filename 없음 ──────────────────────► generate_response → END
           └── use_react=True  → react_reason (ReAct 경로)
                 ├── tool_calls 있음 → react_act → react_reason (루프)
-                └── tool_calls 없음 ──────────────────────────────► END
+                └── tool_calls 없음 ───────────────────────────────► END
     """
     workflow = StateGraph(AgentState)
 
-    # ── 파이프라인 노드 (기존) ──────────────────────────────────────────────
+    # ── 파이프라인 노드 ────────────────────────────────────────────────────
     workflow.add_node("classify_intent",   make_classify_intent_node())
+    workflow.add_node("web_search",        make_web_search_node(deps.tavily_api_key))
     workflow.add_node("check_loaded",      make_check_loaded_node(deps.session_factory))
     workflow.add_node("run_ingestion",     make_run_ingestion_node(
         session_factory=deps.session_factory,
@@ -135,6 +142,7 @@ def build_graph(deps: GraphDeps):
         dataset_handle=deps.dataset_handle,
         ingest_nrows=deps.ingest_nrows,
         exchange_rate=deps.exchange_rate,
+        tavily_api_key=deps.tavily_api_key,
     ))
 
     # ── 진입점: use_react 플래그로 경로 분기 ──────────────────────────────
@@ -144,12 +152,17 @@ def build_graph(deps: GraphDeps):
         {"classify_intent": "classify_intent", "react_reason": "react_reason"},
     )
 
-    # ── 파이프라인 엣지 (기존) ─────────────────────────────────────────────
+    # ── 파이프라인 엣지 ───────────────────────────────────────────────────
     workflow.add_conditional_edges(
         "classify_intent",
         _route_after_classify,
-        {"check_loaded": "check_loaded", "generate_response": "generate_response"},
+        {
+            "web_search":        "web_search",
+            "check_loaded":      "check_loaded",
+            "generate_response": "generate_response",
+        },
     )
+    workflow.add_edge("web_search", "generate_response")
     workflow.add_conditional_edges(
         "check_loaded",
         _route_check_loaded,

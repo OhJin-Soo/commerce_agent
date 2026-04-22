@@ -76,6 +76,10 @@ _CATEGORY_MAP: dict[str, tuple[str, str]] = {
     "장난감":   ("Toys and Games.csv",          "Toys and Games"),
 }
 
+# 웹 검색(비정형 외부 정보) 키워드 → "web_search" 인텐트
+# 특정 상품의 사용자 평가·후기·리뷰처럼 DB 에 없는 비정형 정보를 요구할 때
+_WEB_SEARCH_KEYWORDS = ("리뷰", "후기", "평가", "의견", "평판", "사람들", "실사용", "사용기")
+
 # 추천·해석 요청 키워드 → "llm" 인텐트
 _LLM_KEYWORDS = ("추천", "비교", "어떤", "왜", "설명", "어때", "좋은")
 
@@ -104,7 +108,13 @@ def make_classify_intent_node() -> NodeFn:
     async def classify_intent(state: AgentState) -> dict:
         q = state["query"].lower()
 
-        intent: Intent = "llm" if any(kw in q for kw in _LLM_KEYWORDS) else "sql"
+        # 우선순위: web_search > llm > sql
+        if any(kw in q for kw in _WEB_SEARCH_KEYWORDS):
+            intent: Intent = "web_search"
+        elif any(kw in q for kw in _LLM_KEYWORDS):
+            intent = "llm"
+        else:
+            intent = "sql"
 
         csv_filename: str | None = None
         category: str | None = None
@@ -267,15 +277,59 @@ def make_run_sql_node(
 
 
 # ---------------------------------------------------------------------------
-# 5. generate_response  — BaseChatModel 필요
+# 5. web_search  — Tavily API 키 필요
+# ---------------------------------------------------------------------------
+
+def make_web_search_node(tavily_api_key: str | None) -> NodeFn:
+    """Tavily 로 웹을 검색해 비정형 외부 정보를 수집한다.
+
+    API 키가 없거나 호출에 실패해도 빈 web_results 로 graceful degradation.
+    결과는 generate_response 노드에서 컨텍스트로 사용된다.
+    """
+
+    async def web_search(state: AgentState) -> dict:
+        if not tavily_api_key:
+            logger.warning("web_search: TAVILY_API_KEY 미설정 → 웹 검색 건너뜀")
+            return {"web_results": []}
+
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=tavily_api_key)
+
+        query = state["query"]
+        logger.info("web_search: query=%r", query)
+        try:
+            resp = await client.search(query, max_results=5)
+            results = resp.get("results", [])[:5]
+            # 필요한 필드만 추출해 상태에 저장
+            web_results = [
+                {
+                    "title":   r.get("title", ""),
+                    "url":     r.get("url", ""),
+                    "content": r.get("content", ""),
+                }
+                for r in results
+            ]
+            logger.info("web_search: %d 건 수집", len(web_results))
+            return {"web_results": web_results}
+        except Exception as exc:
+            logger.error("web_search 실패: %s", exc)
+            return {"web_results": [], "error": str(exc)}
+
+    return web_search
+
+
+# ---------------------------------------------------------------------------
+# 6. generate_response  — BaseChatModel 필요
 # ---------------------------------------------------------------------------
 
 def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # type: ignore[type-arg]
-    """sql_rows(있으면) + query 를 바탕으로 자연어 응답을 생성한다.
+    """sql_rows / web_results + query 를 바탕으로 자연어 응답을 생성한다.
 
-    DB 가격(INR)을 exchange_rate 로 곱해 KRW 로 변환 후 LLM 컨텍스트에 전달한다.
-    `llm` 은 `langchain_core.language_models.BaseChatModel` 호환 객체.
-    Phase 2 에서 HuggingFace 서빙 엔드포인트로 교체 예정.
+    - sql_rows 가 있으면 DB 상품 데이터를 컨텍스트로 사용한다.
+    - web_results 가 있으면 Tavily 검색 결과를 컨텍스트로 사용한다.
+    - 둘 다 없으면 LLM 자체 지식으로 답변한다.
+
+    DB 가격(INR)을 exchange_rate 로 곱해 KRW 로 변환한다.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -293,20 +347,33 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
         except (TypeError, ValueError):
             return "가격 미상"
 
-    async def generate_response(state: AgentState) -> dict:
-        rows = state.get("sql_rows", [])
-        context = (
-            "\n".join(
+    def _build_context(state: AgentState) -> str:
+        """우선순위: web_results > sql_rows > 없음."""
+        web_results: list[dict] = state.get("web_results") or []
+        if web_results:
+            parts = []
+            for r in web_results:
+                parts.append(
+                    f"[출처: {r.get('title', '')}] ({r.get('url', '')})\n"
+                    f"{r.get('content', '')}"
+                )
+            return "웹 검색 결과:\n" + "\n\n".join(parts)
+
+        rows: list[dict] = state.get("sql_rows") or []
+        if rows:
+            return "상품 데이터:\n" + "\n".join(
                 f"- {r.get('name')} ({r.get('brand')}) "
                 f"가격={_to_krw(r.get('price'))} 평점={r.get('rating')}"
                 for r in rows[:10]
             )
-            if rows
-            else "관련 상품 데이터 없음"
-        )
+
+        return "관련 데이터 없음"
+
+    async def generate_response(state: AgentState) -> dict:
+        context = _build_context(state)
         messages = [
             SystemMessage(content=SYSTEM),
-            HumanMessage(content=f"질문: {state['query']}\n\n상품 데이터:\n{context}"),
+            HumanMessage(content=f"질문: {state['query']}\n\n{context}"),
         ]
         try:
             ai_msg = await llm.ainvoke(messages)

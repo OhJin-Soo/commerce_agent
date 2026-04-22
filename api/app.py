@@ -38,6 +38,7 @@ async def lifespan(app: FastAPI):
         "lokeshparab/amazon-products-dataset",
     )
     ingest_nrows = int(os.getenv("KAGGLE_NROWS", "50000"))
+    tavily_api_key = os.getenv("TAVILY_API_KEY") or None
 
     exchange_rate = await fetch_inr_to_krw()
     logger.info(
@@ -53,6 +54,7 @@ async def lifespan(app: FastAPI):
             dataset_handle=ingest_handle,
             ingest_nrows=ingest_nrows,
             exchange_rate=exchange_rate,
+            tavily_api_key=tavily_api_key,
         )
         graphs[model] = build_graph(deps)
         logger.info("Graph ready  model=%s", model)

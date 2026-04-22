@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Literal, NotRequired, TypedDict
 
 # Intent 값: classify_intent 노드가 결정한다.
-#   "sql" → check_loaded → (run_ingestion →) run_sql → generate_response
-#   "llm" → generate_response
-Intent = Literal["sql", "llm"]
+#   "sql"        → check_loaded → (run_ingestion →) run_sql → generate_response
+#   "llm"        → generate_response
+#   "web_search" → web_search (Tavily) → generate_response
+Intent = Literal["sql", "llm", "web_search"]
 
 
 class AgentState(TypedDict):
@@ -27,6 +28,9 @@ class AgentState(TypedDict):
 
     # --- run_sql 이 채운다 (파이프라인 경로) ---
     sql_rows: NotRequired[list[dict]]
+
+    # --- web_search 노드가 채운다 (web_search 인텐트) ---
+    web_results: NotRequired[list[dict]]    # [{title, url, content}, ...]
 
     # --- generate_response / react_reason 이 채운다 ---
     response: NotRequired[str]

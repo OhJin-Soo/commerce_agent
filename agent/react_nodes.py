@@ -71,6 +71,10 @@ class QueryProductsInput(BaseModel):
     limit: int = Field(10, description="반환할 최대 상품 수")
 
 
+class SearchWebInput(BaseModel):
+    query: str = Field(..., description="웹에서 검색할 질문 (예: 'Sony WH-1000XM5 사용자 리뷰')")
+
+
 def _noop(**_: Any) -> str:  # bind_tools 용 더미 함수 (실행되지 않음)
     return ""
 
@@ -102,6 +106,15 @@ TOOL_SCHEMAS: list[StructuredTool] = [
         name="query_products",
         description="조건에 맞는 상품을 DB에서 조회한다",
         args_schema=QueryProductsInput,
+    ),
+    StructuredTool.from_function(
+        func=_noop,
+        name="search_web",
+        description=(
+            "Tavily 로 웹을 검색해 상품 리뷰·후기·평가 등 비정형 외부 정보를 수집한다. "
+            "DB에 없는 사용자 의견이나 최신 정보가 필요할 때 사용하라"
+        ),
+        args_schema=SearchWebInput,
     ),
 ]
 
@@ -207,6 +220,30 @@ async def _exec_query_products(
         return json.dumps({"products": [], "error": str(exc)})
 
 
+async def _exec_search_web(tavily_api_key: str | None, query: str) -> str:
+    """Tavily 로 웹 검색을 수행하고 결과를 JSON 문자열로 반환한다."""
+    if not tavily_api_key:
+        return json.dumps(
+            {"results": [], "message": "TAVILY_API_KEY 미설정"},
+            ensure_ascii=False,
+        )
+    from tavily import AsyncTavilyClient
+    try:
+        client = AsyncTavilyClient(api_key=tavily_api_key)
+        resp = await client.search(query, max_results=5)
+        results = [
+            {
+                "title":   r.get("title", ""),
+                "url":     r.get("url", ""),
+                "content": r.get("content", ""),
+            }
+            for r in resp.get("results", [])[:5]
+        ]
+        return json.dumps({"results": results}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"results": [], "error": str(exc)}, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # 1. react_reason 노드
 # ---------------------------------------------------------------------------
@@ -268,6 +305,7 @@ def make_react_act_node(
     dataset_handle: str,
     ingest_nrows: int | None,
     exchange_rate: float,
+    tavily_api_key: str | None = None,
 ):
     """마지막 AIMessage 의 tool_calls 를 모두 실행하고 ToolMessage 를 추가한다."""
 
@@ -284,6 +322,8 @@ def make_react_act_node(
             return await _exec_query_products(
                 session_factory, exchange_rate, **args
             )
+        if name == "search_web":
+            return await _exec_search_web(tavily_api_key, **args)
         return json.dumps({"error": f"알 수 없는 도구: {name}"})
 
     async def react_act(state: AgentState) -> dict:
