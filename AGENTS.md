@@ -11,6 +11,10 @@ uv run python main.py
 # Preload Kaggle product data into DB
 uv run python preload.py
 
+# Evaluate models
+uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b --path pipeline
+uv run python eval_models.py --models llama3.1:8b --path query-plan
+
 # Add a dependency
 uv add <package>
 

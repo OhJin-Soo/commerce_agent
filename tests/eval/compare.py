@@ -593,6 +593,66 @@ async def run_compare_eval(
     )
 
 
+async def run_path_eval(
+    graph,
+    cases: list[ReactGoldenCase],
+    use_react: bool,
+    session_factory: async_sessionmaker | None = None,
+    model_name: str = "unknown",
+    input_cost_per_1k: float = 0.0,
+    output_cost_per_1k: float = 0.0,
+) -> CompareSummary:
+    """pipeline 또는 ReAct 중 한 경로만 실행해 CompareSummary 형태로 반환한다."""
+    compare_cases: list[CompareCase] = []
+
+    for case in cases:
+        path_res = await _run_path(
+            graph,
+            case.query,
+            use_react=use_react,
+            input_cost_per_1k=input_cost_per_1k,
+            output_cost_per_1k=output_cost_per_1k,
+        )
+        ref_rows = (
+            await _fetch_ref_rows(session_factory, case.reference_sql)
+            if session_factory else []
+        )
+        metrics = _compute_metrics(path_res, ref_rows, case, is_react=use_react)
+
+        if use_react:
+            compare_cases.append(
+                CompareCase(
+                    query=case.query,
+                    expected_csv=case.csv_filename,
+                    pipeline=PathResult(),
+                    react=path_res,
+                    pipeline_metrics=PathMetrics(),
+                    react_metrics=metrics,
+                )
+            )
+        else:
+            compare_cases.append(
+                CompareCase(
+                    query=case.query,
+                    expected_csv=case.csv_filename,
+                    pipeline=path_res,
+                    react=PathResult(),
+                    pipeline_metrics=metrics,
+                    react_metrics=PathMetrics(),
+                )
+            )
+
+    pipe_agg, react_agg = _aggregate(compare_cases)
+    return CompareSummary(
+        model_name=model_name,
+        n=len(compare_cases),
+        has_db_eval=session_factory is not None,
+        pipeline=pipe_agg,
+        react=react_agg,
+        cases=compare_cases,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 모델 비교 전용 자료구조 및 실행 함수
 # ---------------------------------------------------------------------------

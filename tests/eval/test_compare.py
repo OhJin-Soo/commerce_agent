@@ -18,6 +18,7 @@ from tests.eval.compare import (
     _was_ingest_unnecessary,
     run_compare_eval,
     run_model_compare_eval,
+    run_path_eval,
 )
 from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics
 from tests.eval.react_golden_set import REACT_GOLDEN_SET, ReactGoldenCase
@@ -471,6 +472,24 @@ class TestRunCompareEval:
         assert "avg_llm_calls"         in out
         assert "tool_recall"           in out
         assert "unnecessary_ingest"    in out
+
+    async def test_run_path_eval_pipeline_only(self):
+        graph = _make_graph(
+            pipeline_state={"sql_rows": [], "response": "", "csv_filename": "Headphones.csv"},
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Speakers.csv", True),
+                "react_iterations": 3,
+            },
+        )
+        summary = await run_path_eval(
+            graph,
+            REACT_GOLDEN_SET[:1],
+            use_react=False,
+            session_factory=None,
+        )
+        assert summary.pipeline.category_hit_rate == pytest.approx(1.0)
+        assert summary.react.category_hit_rate == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
