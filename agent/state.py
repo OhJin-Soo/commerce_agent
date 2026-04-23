@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Literal, NotRequired, TypedDict
 
 # Intent 값: classify_intent 노드가 결정한다.
-#   "sql"        → check_loaded → (run_ingestion →) run_sql → generate_response
+#   "sql"        → check_loaded → run_sql → generate_response
 #   "llm"        → generate_response
 #   "web_search" → web_search (Tavily) → generate_response
 Intent = Literal["sql", "llm", "web_search"]
@@ -24,7 +24,7 @@ class AgentState(TypedDict):
     csv_filename: NotRequired[str | None]   # Kaggle CSV 파일명 (e.g. "Headphones.csv")
 
     # --- check_loaded 가 채운다 (파이프라인 경로) ---
-    data_loaded: NotRequired[bool]          # True → run_sql, False → run_ingestion
+    data_loaded: NotRequired[bool]          # 참고용. 요청 중 ingestion 은 수행하지 않는다.
 
     # --- generate_query_plan / run_sql 이 채운다 (파이프라인 경로) ---
     query_plan: NotRequired[dict]           # LLM structured output 기반 검색 계획

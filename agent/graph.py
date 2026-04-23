@@ -27,8 +27,7 @@ Usage::
     classify_intent                      react_reason ◄──────────────────────┐
       │                                    │ (tool_calls)                    │
       ├── csv_filename 있음 → check_loaded  └──► react_act ──────────────────┘
-      │     ├── loaded=True  → run_sql → generate_response → END
-      │     └── loaded=False → run_ingestion → run_sql → generate_response → END
+      │     └── loaded 여부와 무관하게 run_sql → generate_response → END
       └── csv_filename 없음 ──────────────► generate_response → END
                                            │ (tool_calls 없음)
                                            └──► END
@@ -47,7 +46,6 @@ from agent.nodes import (
     make_classify_intent_node,
     make_generate_query_plan_node,
     make_generate_response_node,
-    make_run_ingestion_node,
     make_run_sql_node,
     make_web_search_node,
 )
@@ -95,7 +93,7 @@ def _route_after_query_plan(state: AgentState) -> str:
 
 
 def _route_check_loaded(state: AgentState) -> str:
-    return "run_sql" if state.get("data_loaded", False) else "run_ingestion"
+    return "run_sql"
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +117,7 @@ def build_graph(deps: GraphDeps):
           ├── use_react=False → classify_intent (파이프라인 경로)
           │     ├── intent=web_search → web_search (Tavily) → generate_response → END
           │     ├── csv_filename 있음 → check_loaded
-          │     │     ├── loaded=True  → run_sql → generate_response → END
-          │     │     └── loaded=False → run_ingestion → run_sql → generate_response → END
+          │     │     └── run_sql → generate_response → END
           │     └── csv_filename 없음 ──────────────────────► generate_response → END
           └── use_react=True  → react_reason (ReAct 경로)
                 ├── tool_calls 있음 → react_act → react_reason (루프)
@@ -133,11 +130,6 @@ def build_graph(deps: GraphDeps):
     workflow.add_node("generate_query_plan", make_generate_query_plan_node(deps.llm))
     workflow.add_node("web_search",        make_web_search_node(deps.tavily_api_key))
     workflow.add_node("check_loaded",      make_check_loaded_node(deps.session_factory))
-    workflow.add_node("run_ingestion",     make_run_ingestion_node(
-        session_factory=deps.session_factory,
-        dataset_handle=deps.dataset_handle,
-        ingest_nrows=deps.ingest_nrows,
-    ))
     workflow.add_node("run_sql",           make_run_sql_node(deps.session_factory, exchange_rate=deps.exchange_rate))
     workflow.add_node("generate_response", make_generate_response_node(deps.llm, exchange_rate=deps.exchange_rate))
 
@@ -176,9 +168,8 @@ def build_graph(deps: GraphDeps):
     workflow.add_conditional_edges(
         "check_loaded",
         _route_check_loaded,
-        {"run_sql": "run_sql", "run_ingestion": "run_ingestion"},
+        {"run_sql": "run_sql"},
     )
-    workflow.add_edge("run_ingestion",     "run_sql")
     workflow.add_edge("run_sql",           "generate_response")
     workflow.add_edge("generate_response", END)
 

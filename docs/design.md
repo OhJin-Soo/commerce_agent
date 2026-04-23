@@ -3,8 +3,8 @@
 ## 개요
 
 Kaggle 공개 데이터셋을 내부 커머스 DB로 축적하는 에이전트.
-사용자가 질문하면 로컬 DB를 먼저 조회하고, 해당 카테고리가 미적재 상태이면 Kaggle CSV → 파싱 → DB 저장 후 응답한다.
-시간이 지날수록 DB에 데이터가 쌓여 재적재 빈도가 낮아지는 구조.
+Kaggle 공개 데이터셋을 별도 preload 스크립트로 내부 커머스 DB에 미리 적재한다.
+사용자 요청 경로는 ingestion 을 수행하지 않고, 이미 적재된 로컬 DB를 조회한 뒤 응답한다.
 
 에이전트 워크플로우는 **LangGraph** `StateGraph`로 구현한다.
 
@@ -90,9 +90,7 @@ LangGraph CommerceGraph
     │  [classify_intent] (키워드 매핑)                                              │
     │      ├─ intent=web_search → [web_search] (Tavily) → [generate_response] → END │
     │      └─ 그 외 → [generate_query_plan] (LLM structured output, 실패 시 fallback)│
-    │              ├─ csv_filename 있음 → [check_loaded]                            │
-    │              │      ├─ loaded=true  → [run_sql] → [generate_response] → END   │
-    │              │      └─ loaded=false → [run_ingestion] → [run_sql] → [generate_response] → END
+    │              ├─ csv_filename 있음 → [check_loaded] → [run_sql] → [generate_response] → END
     │              └─ csv_filename 없음 ───────────→ [generate_response] → END       │
     │                                                                               │
     └─ use_react=true ──────────────────────────────────────────────────────────────┘
@@ -104,8 +102,8 @@ LangGraph CommerceGraph
            │ tool_calls 없음
            └──► END
 
-[run_ingestion] = IngestionPipeline(KaggleLoad → Normalize → Upsert)
-[react_act] 사용 가능 도구: search_category / check_db_loaded / ingest_data / query_products / search_web
+[preload.py] = IngestionPipeline(KaggleLoad → Normalize → Upsert)
+[react_act] 사용 가능 도구: search_category / check_db_loaded / query_products / search_web
 ```
 
 ---
@@ -121,7 +119,7 @@ LangGraph CommerceGraph
 from typing import Literal, NotRequired, TypedDict
 
 Intent = Literal["sql", "llm", "web_search"]
-#   "sql"        → check_loaded → (run_ingestion →) run_sql → generate_response
+#   "sql"        → check_loaded → run_sql → generate_response
 #   "llm"        → generate_response  (카테고리 키워드 없으면 LLM 직행)
 #   "web_search" → web_search (Tavily) → generate_response
 
@@ -138,7 +136,7 @@ class AgentState(TypedDict):
     csv_filename: NotRequired[str | None] # Kaggle CSV 파일명 (예: "Headphones.csv")
 
     # ── check_loaded가 채움 ───────────────────────────────────────────
-    data_loaded: NotRequired[bool]        # True → run_sql, False → run_ingestion
+    data_loaded: NotRequired[bool]        # 참고용. 요청 중 ingestion 은 수행하지 않음
 
     # ── generate_query_plan / run_sql이 채움 ──────────────────────────
     query_plan: NotRequired[dict]         # LLM structured output 기반 검색 계획
@@ -167,7 +165,7 @@ class AgentState(TypedDict):
 | `generate_query_plan` | `agent/nodes.py` | LLM structured output으로 QueryPlan 생성. 실패 시 기존 `_build_sql()` fallback |
 | `web_search` | `agent/nodes.py` | Tavily API로 웹 검색, 결과를 `web_results`에 저장 (`web_search` 인텐트 전용) |
 | `check_loaded` | `agent/nodes.py` | source_site 기준으로 DB에 데이터 존재 여부 확인 |
-| `run_ingestion` | `agent/nodes.py` | IngestionPipeline 실행 (Kaggle CSV → DB upsert) |
+| `preload.py` | 프로젝트 루트 | 요청 전 Kaggle CSV → DB upsert 를 수행하는 별도 스크립트 |
 | `run_sql` | `agent/nodes.py` | QueryPlan → SQLAlchemy select 실행. QueryPlan 없거나 실패하면 기존 규칙 기반 `_build_sql()` 실행 |
 | `generate_response` | `agent/nodes.py` | `web_results` > `sql_rows` 순 우선순위로 컨텍스트를 구성해 LLM 응답 생성 |
 
@@ -186,7 +184,6 @@ class AgentState(TypedDict):
 |---|---|---|
 | `search_category` | 키워드 → CSV 파일명 + 카테고리 레이블 | 순수 함수, DB 없음 |
 | `check_db_loaded` | DB에 해당 source_site 데이터가 있는지 확인 | DB SELECT |
-| `ingest_data` | Kaggle CSV 내려받아 DB upsert | Kaggle + DB |
 | `query_products` | 가격·카테고리 조건으로 상품 조회 | DB SELECT |
 | `search_web` | Tavily로 웹 검색 — 리뷰·후기 등 비정형 외부 정보 수집 | Tavily API |
 

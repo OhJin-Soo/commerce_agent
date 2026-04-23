@@ -281,8 +281,8 @@ class TestGraph:
         assert result["sql_rows"][0]["name"] == "Sony WH-1000XM5"
         assert result["response"] == "Sony를 추천합니다."
 
-    async def test_sql_not_loaded_triggers_ingestion(self):
-        """데이터 없음 → run_ingestion → run_sql."""
+    async def test_sql_not_loaded_does_not_trigger_ingestion(self):
+        """데이터 없음 → 요청 중 ingestion 없이 run_sql."""
         product = {"id": 2, "name": "JBL Tune 510BT", "price": 79000, "rating": 4.2}
         factory = _make_session_factory(rows=[product], check_row=False)
         session = factory.return_value.__aenter__.return_value
@@ -300,6 +300,7 @@ class TestGraph:
 
         assert result["data_loaded"] is False
         assert "sql_rows" in result
+        mock_load.assert_not_awaited()
 
     async def test_llm_with_category_queries_db(self):
         """llm 인텐트라도 csv_filename 있으면 DB 조회 후 generate_response."""

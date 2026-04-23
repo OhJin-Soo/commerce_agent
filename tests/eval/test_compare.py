@@ -97,14 +97,14 @@ class TestToolSequenceMetrics:
         assert m["tool_recall"]    == pytest.approx(1.0)
         assert m["tool_precision"] == pytest.approx(1.0)
 
-    def test_with_optional_ingest(self):
-        """optional 인 ingest_data 를 포함해도 precision 이 1.0 이어야 한다."""
+    def test_unexpected_ingest_penalized(self):
+        """요청 경로에서 ingest_data 를 호출하면 precision 이 낮아져야 한다."""
         required = ["search_category", "check_db_loaded", "query_products"]
-        optional = ["ingest_data"]
+        optional = []
         actual   = ["search_category", "check_db_loaded", "ingest_data", "query_products"]
         m = tool_sequence_metrics(required, optional, actual)
         assert m["tool_recall"]    == pytest.approx(1.0)
-        assert m["tool_precision"] == pytest.approx(1.0)
+        assert m["tool_precision"] == pytest.approx(3 / 4)
 
     def test_missing_required(self):
         """query_products 를 빠뜨리면 recall < 1."""
@@ -223,7 +223,7 @@ class TestComputeMetrics:
             query="이어폰 5만원 이하",
             csv_filename="Headphones.csv",
             required_tools=["search_category", "check_db_loaded", "query_products"],
-            optional_tools=["ingest_data"],
+            optional_tools=[],
             reference_sql="SELECT 1",
         )
 
@@ -496,13 +496,13 @@ class TestReactGoldenSet:
             assert "check_db_loaded" in c.required_tools,  f"{c.query}: check_db_loaded 누락"
             assert "query_products"  in c.required_tools,  f"{c.query}: query_products 누락"
 
-    def test_ingest_in_optional_not_required(self):
+    def test_ingest_not_allowed_in_request_path(self):
         for c in REACT_GOLDEN_SET:
             assert "ingest_data" not in c.required_tools, (
-                f"{c.query}: ingest_data 는 optional 이어야 합니다"
+                f"{c.query}: ingest_data 는 request path 에서 호출하면 안 됩니다"
             )
-            assert "ingest_data" in c.optional_tools, (
-                f"{c.query}: ingest_data 가 optional_tools 에 없습니다"
+            assert "ingest_data" not in c.optional_tools, (
+                f"{c.query}: ingest_data 는 optional_tools 에도 없어야 합니다"
             )
 
     def test_all_cases_have_csv_filename(self):

@@ -11,8 +11,7 @@
 사용 가능한 도구:
     1. search_category   - 키워드 → CSV 파일명 + 카테고리 레이블
     2. check_db_loaded   - DB에 해당 CSV 데이터가 있는지 확인
-    3. ingest_data       - Kaggle CSV 내려받아 DB에 upsert
-    4. query_products    - 조건에 맞는 상품을 DB에서 조회
+    3. query_products    - 조건에 맞는 상품을 DB에서 조회
 """
 from __future__ import annotations
 
@@ -28,8 +27,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent.nodes import _CATEGORY_MAP, _source_site_from
 from agent.state import AgentState
-from pipeline.ingestion import IngestionPipeline
-from pipeline.kaggle_load import KaggleDatasetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +38,10 @@ SYSTEM_PROMPT = (
     "권장 워크플로우:\n"
     "1. search_category 로 관련 카테고리 CSV 파일명을 찾는다\n"
     "2. check_db_loaded 로 DB에 데이터가 있는지 확인한다\n"
-    "3. 데이터가 없으면 ingest_data 로 적재한다 (있으면 생략)\n"
-    "4. query_products 로 조건에 맞는 상품을 조회한다\n"
-    "5. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
+    "3. query_products 로 조건에 맞는 상품을 조회한다\n"
+    "4. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
+    "중요: 요청 처리 중에는 데이터를 적재하지 않는다. DB에 데이터가 없으면 "
+    "적재가 필요하다고 설명하고, 별도 preload 스크립트 실행을 안내한다.\n\n"
     "가격은 항상 원화(₩)로 표시하세요."
 )
 
@@ -58,10 +56,6 @@ class SearchCategoryInput(BaseModel):
 
 class CheckDbLoadedInput(BaseModel):
     csv_filename: str = Field(..., description="확인할 CSV 파일명 (예: 'Headphones.csv')")
-
-
-class IngestDataInput(BaseModel):
-    csv_filename: str = Field(..., description="적재할 CSV 파일명 (예: 'Headphones.csv')")
 
 
 class QueryProductsInput(BaseModel):
@@ -91,15 +85,6 @@ TOOL_SCHEMAS: list[StructuredTool] = [
         name="check_db_loaded",
         description="DB에 해당 CSV 데이터가 로드되어 있는지 확인한다",
         args_schema=CheckDbLoadedInput,
-    ),
-    StructuredTool.from_function(
-        func=_noop,
-        name="ingest_data",
-        description=(
-            "Kaggle CSV를 내려받아 DB에 upsert한다. "
-            "check_db_loaded 결과가 False일 때만 호출하라"
-        ),
-        args_schema=IngestDataInput,
     ),
     StructuredTool.from_function(
         func=_noop,
@@ -157,26 +142,6 @@ async def _exec_check_db_loaded(
         return json.dumps({"loaded": row is not None, "source_site": source_site})
     except Exception as exc:
         return json.dumps({"loaded": False, "error": str(exc)})
-
-
-async def _exec_ingest_data(
-    session_factory: async_sessionmaker,
-    dataset_handle: str,
-    ingest_nrows: int | None,
-    csv_filename: str,
-) -> str:
-    source_site = _source_site_from(csv_filename) or "kaggle/amazon-products/unknown"
-    config = KaggleDatasetConfig(
-        handle=dataset_handle, filename=csv_filename, nrows=ingest_nrows
-    )
-    try:
-        async with session_factory() as session:
-            products = await IngestionPipeline(
-                source_site=source_site, session=session
-            ).run(config)
-        return json.dumps({"upserted": len(products), "source_site": source_site})
-    except Exception as exc:
-        return json.dumps({"upserted": 0, "error": str(exc)})
 
 
 async def _exec_query_products(
@@ -317,10 +282,6 @@ def make_react_act_node(
             return _exec_search_category(**args)
         if name == "check_db_loaded":
             return await _exec_check_db_loaded(session_factory, **args)
-        if name == "ingest_data":
-            return await _exec_ingest_data(
-                session_factory, dataset_handle, ingest_nrows, **args
-            )
         if name == "query_products":
             return await _exec_query_products(
                 session_factory, exchange_rate, **args

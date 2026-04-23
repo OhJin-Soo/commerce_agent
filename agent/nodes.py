@@ -5,7 +5,7 @@
 
 노드 흐름::
 
-    classify_intent → check_loaded → run_ingestion? → run_sql → generate_response
+    classify_intent → check_loaded → run_sql → generate_response
     classify_intent → generate_response  (llm 인텐트)
 """
 from __future__ import annotations
@@ -24,8 +24,6 @@ from agent.query_plan import (
     resolve_plan_csv_filename,
 )
 from agent.state import AgentState, Intent
-from pipeline.ingestion import IngestionPipeline
-from pipeline.kaggle_load import KaggleDatasetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +145,7 @@ def make_check_loaded_node(session_factory: async_sessionmaker) -> NodeFn:
 
     - csv_filename 이 없으면 data_loaded=False (카테고리 불명 → 인제스트 생략, llm 경로)
     - 1건 이상 존재 → data_loaded=True  → run_sql 직행
-    - 0건            → data_loaded=False → run_ingestion 경유
+    - 0건            → data_loaded=False 를 기록하지만 요청 중 적재하지 않는다
     """
 
     async def check_loaded(state: AgentState) -> dict:
@@ -180,48 +178,7 @@ def make_check_loaded_node(session_factory: async_sessionmaker) -> NodeFn:
 
 
 # ---------------------------------------------------------------------------
-# 3. run_ingestion  — session_factory + dataset_handle 필요
-# ---------------------------------------------------------------------------
-
-def make_run_ingestion_node(
-    session_factory: async_sessionmaker,
-    dataset_handle: str,
-    ingest_nrows: int | None = None,
-) -> NodeFn:
-    """state["csv_filename"] 에 해당하는 CSV 한 파일만 내려받아 upsert 한다.
-
-    source_site 를 csv_filename stem 으로 설정해 check_loaded 와 run_sql 이
-    같은 기준으로 데이터를 조회할 수 있도록 한다.
-    """
-
-    async def run_ingestion(state: AgentState) -> dict:
-        csv_filename = state.get("csv_filename")
-        source_site = _source_site_from(csv_filename) or "kaggle/amazon-products/unknown"
-
-        config = KaggleDatasetConfig(
-            handle=dataset_handle,
-            filename=csv_filename,   # None 이면 KaggleLoadFilter 가 첫 번째 CSV 사용
-            nrows=ingest_nrows,
-        )
-        logger.info("run_ingestion: file=%s  source_site=%s", csv_filename, source_site)
-        try:
-            async with session_factory() as session:
-                pipeline = IngestionPipeline(
-                    source_site=source_site,
-                    session=session,
-                )
-                products = await pipeline.run(config)
-            logger.info("run_ingestion: upserted %d products", len(products))
-            return {}
-        except Exception as exc:
-            logger.error("run_ingestion failed: %s", exc)
-            return {"error": str(exc)}
-
-    return run_ingestion
-
-
-# ---------------------------------------------------------------------------
-# 4. generate_query_plan — BaseChatModel 필요
+# 3. generate_query_plan — BaseChatModel 필요
 # ---------------------------------------------------------------------------
 
 def make_generate_query_plan_node(llm) -> NodeFn:  # type: ignore[type-arg]
@@ -286,7 +243,7 @@ def make_generate_query_plan_node(llm) -> NodeFn:  # type: ignore[type-arg]
 
 
 # ---------------------------------------------------------------------------
-# 5. run_sql  — session_factory 필요
+# 4. run_sql  — session_factory 필요
 # ---------------------------------------------------------------------------
 
 def _build_sql(
@@ -364,7 +321,7 @@ def make_run_sql_node(
 
 
 # ---------------------------------------------------------------------------
-# 6. web_search  — Tavily API 키 필요
+# 5. web_search  — Tavily API 키 필요
 # ---------------------------------------------------------------------------
 
 def make_web_search_node(tavily_api_key: str | None) -> NodeFn:
@@ -406,7 +363,7 @@ def make_web_search_node(tavily_api_key: str | None) -> NodeFn:
 
 
 # ---------------------------------------------------------------------------
-# 7. generate_response  — BaseChatModel 필요
+# 6. generate_response  — BaseChatModel 필요
 # ---------------------------------------------------------------------------
 
 def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # type: ignore[type-arg]
