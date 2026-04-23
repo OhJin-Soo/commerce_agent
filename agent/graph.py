@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from agent.nodes import (
     make_check_loaded_node,
     make_classify_intent_node,
+    make_generate_query_plan_node,
     make_generate_response_node,
     make_run_ingestion_node,
     make_run_sql_node,
@@ -81,11 +82,15 @@ def _route_after_classify(state: AgentState) -> str:
     """인텐트와 csv_filename 에 따라 다음 노드를 결정한다.
 
     - web_search 인텐트 → web_search 노드 (Tavily 호출)
-    - csv_filename 있음  → check_loaded (DB 조회 경로)
-    - csv_filename 없음  → generate_response (LLM 직행)
+    - 그 외 → generate_query_plan 노드에서 structured output 시도
     """
     if state.get("intent") == "web_search":
         return "web_search"
+    return "generate_query_plan"
+
+
+def _route_after_query_plan(state: AgentState) -> str:
+    """QueryPlan 이후 카테고리가 있으면 DB 경로, 없으면 LLM 직행."""
     return "check_loaded" if state.get("csv_filename") else "generate_response"
 
 
@@ -125,6 +130,7 @@ def build_graph(deps: GraphDeps):
 
     # ── 파이프라인 노드 ────────────────────────────────────────────────────
     workflow.add_node("classify_intent",   make_classify_intent_node())
+    workflow.add_node("generate_query_plan", make_generate_query_plan_node(deps.llm))
     workflow.add_node("web_search",        make_web_search_node(deps.tavily_api_key))
     workflow.add_node("check_loaded",      make_check_loaded_node(deps.session_factory))
     workflow.add_node("run_ingestion",     make_run_ingestion_node(
@@ -158,11 +164,15 @@ def build_graph(deps: GraphDeps):
         _route_after_classify,
         {
             "web_search":        "web_search",
-            "check_loaded":      "check_loaded",
-            "generate_response": "generate_response",
+            "generate_query_plan": "generate_query_plan",
         },
     )
     workflow.add_edge("web_search", "generate_response")
+    workflow.add_conditional_edges(
+        "generate_query_plan",
+        _route_after_query_plan,
+        {"check_loaded": "check_loaded", "generate_response": "generate_response"},
+    )
     workflow.add_conditional_edges(
         "check_loaded",
         _route_check_loaded,

@@ -89,10 +89,11 @@ LangGraph CommerceGraph
     │                                                                               │
     │  [classify_intent] (키워드 매핑)                                              │
     │      ├─ intent=web_search → [web_search] (Tavily) → [generate_response] → END │
-    │      ├─ csv_filename 있음 → [check_loaded]                                    │
-    │      │      ├─ loaded=true  → [run_sql] → [generate_response] → END           │
-    │      │      └─ loaded=false → [run_ingestion] → [run_sql] → [generate_response] → END
-    │      └─ csv_filename 없음 ──────────────────→ [generate_response] → END       │
+    │      └─ 그 외 → [generate_query_plan] (LLM structured output, 실패 시 fallback)│
+    │              ├─ csv_filename 있음 → [check_loaded]                            │
+    │              │      ├─ loaded=true  → [run_sql] → [generate_response] → END   │
+    │              │      └─ loaded=false → [run_ingestion] → [run_sql] → [generate_response] → END
+    │              └─ csv_filename 없음 ───────────→ [generate_response] → END       │
     │                                                                               │
     └─ use_react=true ──────────────────────────────────────────────────────────────┘
            │
@@ -139,7 +140,9 @@ class AgentState(TypedDict):
     # ── check_loaded가 채움 ───────────────────────────────────────────
     data_loaded: NotRequired[bool]        # True → run_sql, False → run_ingestion
 
-    # ── run_sql이 채움 ────────────────────────────────────────────────
+    # ── generate_query_plan / run_sql이 채움 ──────────────────────────
+    query_plan: NotRequired[dict]         # LLM structured output 기반 검색 계획
+    query_plan_error: NotRequired[str | None]
     sql_rows: NotRequired[list[dict]]
 
     # ── web_search 노드가 채움 ────────────────────────────────────────
@@ -161,10 +164,11 @@ class AgentState(TypedDict):
 | 노드 | 파일 | 역할 |
 |---|---|---|
 | `classify_intent` | `agent/nodes.py` | 키워드 매핑으로 intent/csv_filename 결정 (Phase 2에서 LLM 교체 예정) |
+| `generate_query_plan` | `agent/nodes.py` | LLM structured output으로 QueryPlan 생성. 실패 시 기존 `_build_sql()` fallback |
 | `web_search` | `agent/nodes.py` | Tavily API로 웹 검색, 결과를 `web_results`에 저장 (`web_search` 인텐트 전용) |
 | `check_loaded` | `agent/nodes.py` | source_site 기준으로 DB에 데이터 존재 여부 확인 |
 | `run_ingestion` | `agent/nodes.py` | IngestionPipeline 실행 (Kaggle CSV → DB upsert) |
-| `run_sql` | `agent/nodes.py` | 키워드 기반 SQL 생성 + 실행 (Phase 2에서 LLM SQL Agent 교체 예정) |
+| `run_sql` | `agent/nodes.py` | QueryPlan → SQLAlchemy select 실행. QueryPlan 없거나 실패하면 기존 규칙 기반 `_build_sql()` 실행 |
 | `generate_response` | `agent/nodes.py` | `web_results` > `sql_rows` 순 우선순위로 컨텍스트를 구성해 LLM 응답 생성 |
 
 `normalize`, `upsert`는 LangGraph 노드가 아닌 `IngestionPipeline` 내부 Filter로 처리한다.
@@ -1191,13 +1195,14 @@ uv run pytest -m eval                             # 프롬프트 변경 후 수�
 - [x] SQL 품질 평가 인프라 (`tests/eval/`: golden_set, metrics, runner, EvalRun/EvalCase DB 기록)
 - [x] **ReAct 경로 추가** (`agent/react_nodes.py`, `use_react` 플래그, `react_steps` 응답 필드)
 - [x] **ReAct vs 파이프라인 비교 평가** (`tests/eval/compare.py`, `react_golden_set.py`)
+- [x] **Structured QueryPlan 경로 추가** (`agent/query_plan.py`, LLM structured output, SQLAlchemy select builder, `_build_sql()` fallback)
 
 ### Phase 2 — 구조 개선
 
 > 목표: classify_intent·run_sql LLM 교체, Clean Architecture 레이어 분리, 커버리지 확대
 
-- [ ] `classify_intent` — LLM structured output으로 교체 (키워드 미매핑 케이스 대응)
-- [ ] `run_sql` — LLM SQL Agent로 교체 (Stage 2: Validator + Retry)
+- [ ] `classify_intent` — QueryPlan 기반 카테고리 해석으로 점진 통합 (키워드 미매핑 케이스 대응)
+- [ ] `run_sql` — SQL Agent는 기본 경로가 아니라 평가/비교용 경로로 추가
 - [ ] `run_compare_eval`로 ReAct vs 파이프라인 품질·비용 비교 측정 후 기본 경로 결정
 - [ ] `IProductRepository` 인터페이스 도입 + 노드 팩토리에 주입
 - [ ] `interface/`, `application/`, `domain/`, `infrastructure/` 레이어 분리

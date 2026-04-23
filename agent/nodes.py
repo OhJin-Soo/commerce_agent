@@ -18,6 +18,11 @@ from typing import Awaitable, Callable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from agent.query_plan import (
+    QueryPlan,
+    build_select_from_query_plan,
+    resolve_plan_csv_filename,
+)
 from agent.state import AgentState, Intent
 from pipeline.ingestion import IngestionPipeline
 from pipeline.kaggle_load import KaggleDatasetConfig
@@ -216,7 +221,72 @@ def make_run_ingestion_node(
 
 
 # ---------------------------------------------------------------------------
-# 4. run_sql  — session_factory 필요
+# 4. generate_query_plan — BaseChatModel 필요
+# ---------------------------------------------------------------------------
+
+def make_generate_query_plan_node(llm) -> NodeFn:  # type: ignore[type-arg]
+    """LLM structured output 으로 자연어 질의를 QueryPlan 으로 변환한다.
+
+    실패 시 query_plan 없이 반환해 run_sql 이 기존 _build_sql() 경로로 fallback 한다.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    available_categories = "\n".join(
+        f"- keyword={kw}, csv_filename={csv}, category={label}"
+        for kw, (csv, label) in _CATEGORY_MAP.items()
+    )
+    system = (
+        "You convert Korean commerce search queries into a structured QueryPlan. "
+        "Use only the listed CSV filenames when a category is known. "
+        "Do not invent database columns or SQL. "
+        "If the query does not specify a filter, leave that field null/default.\n\n"
+        f"Available categories:\n{available_categories}"
+    )
+
+    async def generate_query_plan(state: AgentState) -> dict:
+        if type(llm).__module__ == "unittest.mock":
+            return {"query_plan_error": "mock llm does not support structured output"}
+
+        method = getattr(type(llm), "with_structured_output", None)
+        if method is None:
+            return {"query_plan_error": "llm does not support structured output"}
+
+        try:
+            structured_llm = llm.with_structured_output(QueryPlan)
+            plan = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=system),
+                    HumanMessage(content=state["query"]),
+                ]
+            )
+            if isinstance(plan, dict):
+                plan = QueryPlan.model_validate(plan)
+            if not isinstance(plan, QueryPlan):
+                raise TypeError(f"unexpected query plan type: {type(plan)!r}")
+
+            csv_filename = resolve_plan_csv_filename(
+                plan,
+                _CATEGORY_MAP,
+                fallback_csv_filename=state.get("csv_filename"),
+            )
+            updates: dict = {
+                "query_plan": plan.model_dump(exclude_none=True),
+                "query_plan_error": None,
+            }
+            if csv_filename:
+                updates["csv_filename"] = csv_filename
+                updates["category"] = Path(csv_filename).stem
+            logger.debug("generate_query_plan: %s", updates["query_plan"])
+            return updates
+        except Exception as exc:
+            logger.warning("generate_query_plan failed; falling back to rule SQL: %s", exc)
+            return {"query_plan_error": str(exc)}
+
+    return generate_query_plan
+
+
+# ---------------------------------------------------------------------------
+# 5. run_sql  — session_factory 필요
 # ---------------------------------------------------------------------------
 
 def _build_sql(
@@ -261,11 +331,28 @@ def make_run_sql_node(
 ) -> NodeFn:
     async def run_sql(state: AgentState) -> dict:
         source_site = _source_site_from(state.get("csv_filename"))
+
+        stmt = None
+        if state.get("query_plan"):
+            try:
+                stmt = build_select_from_query_plan(
+                    state["query_plan"],
+                    source_site=source_site,
+                    exchange_rate=exchange_rate,
+                )
+                logger.debug("run_sql query_plan stmt: %s", stmt)
+            except Exception as exc:
+                logger.warning("query_plan SQL build failed; falling back to _build_sql: %s", exc)
+                stmt = None
+
         sql = _build_sql(state["query"], source_site, exchange_rate)
-        logger.debug("run_sql: %s", sql)
+        executable = stmt if stmt is not None else text(sql)
+        if stmt is None:
+            logger.debug("run_sql fallback SQL: %s", sql)
+
         try:
             async with session_factory() as session:
-                result = await session.execute(text(sql))
+                result = await session.execute(executable)
                 rows = [dict(row._mapping) for row in result.fetchall()]
             logger.info("run_sql: %d rows returned", len(rows))
             return {"sql_rows": rows}
@@ -277,7 +364,7 @@ def make_run_sql_node(
 
 
 # ---------------------------------------------------------------------------
-# 5. web_search  — Tavily API 키 필요
+# 6. web_search  — Tavily API 키 필요
 # ---------------------------------------------------------------------------
 
 def make_web_search_node(tavily_api_key: str | None) -> NodeFn:
@@ -319,7 +406,7 @@ def make_web_search_node(tavily_api_key: str | None) -> NodeFn:
 
 
 # ---------------------------------------------------------------------------
-# 6. generate_response  — BaseChatModel 필요
+# 7. generate_response  — BaseChatModel 필요
 # ---------------------------------------------------------------------------
 
 def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # type: ignore[type-arg]

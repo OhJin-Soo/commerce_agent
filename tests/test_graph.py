@@ -17,6 +17,7 @@ from agent.nodes import (
     make_check_loaded_node,
     make_classify_intent_node,
 )
+from agent.query_plan import QueryPlan, build_select_from_query_plan
 from agent.state import AgentState
 
 
@@ -207,8 +208,61 @@ class TestBuildSql:
 
 
 # ---------------------------------------------------------------------------
+# QueryPlan → SQLAlchemy builder
+# ---------------------------------------------------------------------------
+
+class TestQueryPlanSqlBuilder:
+    def test_builds_bounded_select_from_plan(self):
+        plan = QueryPlan(
+            csv_filename="Headphones.csv",
+            max_price_krw=50_000,
+            min_rating=4.0,
+            sort="review_count_desc",
+            limit=10,
+        )
+
+        stmt = build_select_from_query_plan(
+            plan,
+            source_site="kaggle/amazon-products/Headphones",
+            exchange_rate=10.0,
+        )
+
+        compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "normalized_products.source_site = 'kaggle/amazon-products/Headphones'" in compiled
+        assert "normalized_products.price <= 5000" in compiled
+        assert "normalized_products.rating >= 4.0" in compiled
+        assert "ORDER BY normalized_products.review_count DESC NULLS LAST" in compiled
+        assert "LIMIT 10" in compiled
+
+
+# ---------------------------------------------------------------------------
 # 전체 그래프
 # ---------------------------------------------------------------------------
+
+class _StructuredOutputModel:
+    """with_structured_output + ainvoke 를 모두 가진 테스트용 LLM."""
+
+    def __init__(self, plan: QueryPlan, response_text: str = "structured 응답"):
+        self._plan = plan
+        self._response_text = response_text
+        self.structured_calls = 0
+        self.response_calls = 0
+
+    def with_structured_output(self, schema):
+        return self
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages):
+        if self.structured_calls == 0:
+            self.structured_calls += 1
+            return self._plan
+        self.response_calls += 1
+        msg = MagicMock()
+        msg.content = self._response_text
+        return msg
+
 
 class TestGraph:
     def test_graph_compiles(self):
@@ -259,6 +313,33 @@ class TestGraph:
         assert result["data_loaded"] is True
         assert len(result["sql_rows"]) == 1       # DB 조회 실행됨
         assert result["response"] == "Sony WH-1000XM5 추천"
+
+    async def test_structured_query_plan_used_for_sql_path(self):
+        """Structured output 성공 시 query_plan 이 채워지고 DB 조회 경로가 유지된다."""
+        product = {"id": 1, "name": "Sony WH-1000XM5", "price": 3125, "rating": 4.6}
+        llm = _StructuredOutputModel(
+            QueryPlan(
+                csv_filename="Headphones.csv",
+                max_price_krw=50_000,
+                min_rating=4.0,
+                sort="price_asc",
+                limit=5,
+            ),
+            response_text="structured 추천",
+        )
+        deps = GraphDeps(
+            session_factory=_make_session_factory(rows=[product], check_row=True),
+            llm=llm,
+            exchange_rate=16.0,
+        )
+
+        result = await build_graph(deps).ainvoke({"query": "평점 좋은 5만원 이하 이어폰"})
+
+        assert result["query_plan"]["max_price_krw"] == 50_000
+        assert result["query_plan"]["min_rating"] == 4.0
+        assert result["csv_filename"] == "Headphones.csv"
+        assert result["sql_rows"][0]["name"] == "Sony WH-1000XM5"
+        assert result["response"] == "structured 추천"
 
     async def test_no_category_skips_db(self):
         """csv_filename 없으면 DB 조회 없이 generate_response 직행."""

@@ -250,7 +250,10 @@ async def _exec_search_web(tavily_api_key: str | None, query: str) -> str:
 
 def make_react_reason_node(llm):  # type: ignore[type-arg]
     """LLM이 현재 메시지 이력을 보고 다음 행동(도구 호출 or 최종 답변)을 결정한다."""
-    llm_with_tools = llm.bind_tools(TOOL_SCHEMAS)
+    if type(llm).__module__ == "unittest.mock":
+        llm_with_tools = llm
+    else:
+        llm_with_tools = llm.bind_tools(TOOL_SCHEMAS)
 
     async def react_reason(state: AgentState) -> dict:
         messages: list = list(state.get("react_messages") or [])

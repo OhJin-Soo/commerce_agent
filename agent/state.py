@@ -26,7 +26,9 @@ class AgentState(TypedDict):
     # --- check_loaded 가 채운다 (파이프라인 경로) ---
     data_loaded: NotRequired[bool]          # True → run_sql, False → run_ingestion
 
-    # --- run_sql 이 채운다 (파이프라인 경로) ---
+    # --- generate_query_plan / run_sql 이 채운다 (파이프라인 경로) ---
+    query_plan: NotRequired[dict]           # LLM structured output 기반 검색 계획
+    query_plan_error: NotRequired[str | None]
     sql_rows: NotRequired[list[dict]]
 
     # --- web_search 노드가 채운다 (web_search 인텐트) ---
