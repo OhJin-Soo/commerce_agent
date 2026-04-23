@@ -355,6 +355,55 @@ class TestRunCompareEval:
         assert summary.react.avg_llm_calls == pytest.approx(4.0)
         assert summary.pipeline.avg_llm_calls == pytest.approx(1.0)
 
+    async def test_pipeline_llm_calls_include_query_plan(self):
+        graph = _make_graph(
+            pipeline_state={
+                "sql_rows": [],
+                "response": "",
+                "csv_filename": "Headphones.csv",
+                "query_plan": {"csv_filename": "Headphones.csv"},
+                "query_plan_llm_calls": 1,
+                "response_llm_calls": 1,
+            },
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Headphones.csv", True),
+                "react_iterations": 1,
+            },
+        )
+        summary = await run_compare_eval(graph, REACT_GOLDEN_SET[:1], session_factory=None)
+        assert summary.pipeline.avg_llm_calls == pytest.approx(2.0)
+
+    async def test_tokens_and_cost_are_aggregated(self):
+        graph = _make_graph(
+            pipeline_state={
+                "sql_rows": [],
+                "response": "",
+                "csv_filename": "Headphones.csv",
+                "response_llm_calls": 1,
+                "llm_input_tokens": 100,
+                "llm_output_tokens": 50,
+                "llm_total_tokens": 150,
+            },
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Headphones.csv", True),
+                "react_iterations": 1,
+                "llm_input_tokens": 20,
+                "llm_output_tokens": 10,
+                "llm_total_tokens": 30,
+            },
+        )
+        summary = await run_compare_eval(
+            graph,
+            REACT_GOLDEN_SET[:1],
+            session_factory=None,
+            input_cost_per_1k=0.1,
+            output_cost_per_1k=0.2,
+        )
+        assert summary.pipeline.avg_total_tokens == pytest.approx(150.0)
+        assert summary.pipeline.total_estimated_cost == pytest.approx(0.02)
+
     async def test_tool_recall_all_required(self):
         """required 3개 도구를 모두 호출하면 tool_recall=1.0."""
         graph = _make_graph(

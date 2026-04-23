@@ -690,13 +690,16 @@ FROM eval_runs ORDER BY created_at DESC;
 tests/eval/
 ├── golden_set.py         # (query, reference_sql) 쌍 10개
 ├── react_golden_set.py   # ReactGoldenCase: golden_set + required_tools + optional_tools
+├── query_plan_golden_set.py # QueryPlan expected_plan 골든셋
 ├── metrics.py            # check_schema / EX / F1 / component_match
-│                         # + grounding_rate / category_hit / tool_sequence_metrics  ← 신규
+│                         # + QueryPlan / top-k / faithfulness / latency helper 지표
 ├── runner.py             # run_eval() → EvalSummary + DB 기록 (SQL 품질 평가)
-├── compare.py            # run_compare_eval() → CompareSummary (ReAct vs 파이프라인)  ← 신규
+├── query_plan_runner.py  # run_query_plan_eval() → QueryPlanEvalSummary
+├── compare.py            # run_compare_eval() → CompareSummary (ReAct vs 파이프라인)
 ├── test_eval_metrics.py  # metrics 단위 테스트 (DB 불필요)
 ├── test_eval_runner.py   # runner 단위 테스트 (DB mock)
-└── test_compare.py       # compare 단위 테스트 45개 (DB·LLM 불필요)  ← 신규
+├── test_query_plan_runner.py
+└── test_compare.py       # compare 단위 테스트 (DB·LLM 불필요)
 
 eval.py                   # 평가 실행 CLI 진입점
 ```
@@ -706,7 +709,8 @@ eval.py                   # 평가 실행 CLI 진입점
 | 실행기 | 대상 | 핵심 지표 |
 |---|---|---|
 | `run_eval()` | SQL 생성 품질 측정 | schema_invalid_rate, EX, F1, component_match |
-| `run_compare_eval()` | ReAct vs 파이프라인 비교 | category_hit, grounding_rate, tool_recall, llm_calls, latency |
+| `run_query_plan_eval()` | LLM structured QueryPlan 품질 측정 | plan_accuracy, field_accuracy, fallback_rate, llm_calls, p95_latency |
+| `run_compare_eval()` | ReAct vs 파이프라인 비교 | category_hit, grounding_rate, faithfulness, precision@5, ndcg@5, tool_recall, llm_calls, latency/token/cost |
 
 **`run_compare_eval` 측정 지표:**
 
@@ -715,9 +719,17 @@ eval.py                   # 평가 실행 CLI 진입점
 | `category_hit` | ✓ | |
 | `execution_accuracy` (EX) | ✓ (DB 필요) | |
 | `result_f1` | ✓ (DB 필요) | |
+| `precision_at_5` | ✓ (DB 필요) | |
+| `ndcg_at_5` | ✓ (DB 필요) | |
 | `grounding_rate` | ✓ | |
+| `answer_faithfulness` | ✓ | |
 | `avg_latency_ms` | ✓ | |
+| `p95_latency_ms` | ✓ | |
 | `avg_llm_calls` | ✓ | |
+| `avg_total_tokens` | ✓ | |
+| `total_estimated_cost` | ✓ | |
+| `fallback_rate` | ✓ | |
+| `query_plan_accuracy` | ✓ | |
 | `tool_recall` | | ✓ |
 | `tool_precision` | | ✓ |
 | `unnecessary_ingest_rate` | | ✓ |

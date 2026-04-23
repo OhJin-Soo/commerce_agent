@@ -29,6 +29,7 @@ class AgentState(TypedDict):
     # --- generate_query_plan / run_sql 이 채운다 (파이프라인 경로) ---
     query_plan: NotRequired[dict]           # LLM structured output 기반 검색 계획
     query_plan_error: NotRequired[str | None]
+    query_plan_llm_calls: NotRequired[int]
     sql_rows: NotRequired[list[dict]]
 
     # --- web_search 노드가 채운다 (web_search 인텐트) ---
@@ -36,6 +37,10 @@ class AgentState(TypedDict):
 
     # --- generate_response / react_reason 이 채운다 ---
     response: NotRequired[str]
+    response_llm_calls: NotRequired[int]
+    llm_input_tokens: NotRequired[int]
+    llm_output_tokens: NotRequired[int]
+    llm_total_tokens: NotRequired[int]
 
     # --- 어느 노드든 오류 발생 시 채운다 ---
     error: NotRequired[str | None]

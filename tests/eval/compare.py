@@ -33,8 +33,13 @@
         execution_accuracy  - sql_rows ID 집합 완전 일치 (EX)  ← DB 필요
         result_f1           - sql_rows ID 집합 F1              ← DB 필요
         grounding_rate      - LLM 응답이 sql_rows 상품을 반영했는가
+        answer_faithfulness - 응답의 가격/평점 반영 정확도
+        precision@k / ndcg@k - top-k retrieval/ranking 품질
         latency_ms          - 경로 전체 실행 시간
+        p95_latency_ms      - 경로 p95 지연 시간
         llm_calls           - LLM 호출 횟수
+        token/cost          - usage metadata 기반 토큰/비용
+        fallback_rate       - structured QueryPlan 실패 후 rule fallback 비율
 
     ReAct 전용
         tool_recall         - required 도구를 빠짐없이 호출했는가
@@ -52,10 +57,16 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from tests.eval.metrics import (
+    answer_faithfulness,
     category_hit,
+    fallback_rate,
     execution_accuracy,
     grounding_rate,
     mean,
+    ndcg_at_k,
+    percentile,
+    precision_at_k,
+    query_plan_accuracy,
     result_f1,
     tool_sequence_metrics,
 )
@@ -125,6 +136,13 @@ class PathResult:
     error: str | None = None
     csv_filename: str | None = None     # 경로가 선택한 카테고리 CSV
     llm_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost: float = 0.0
+    query_plan: dict | None = None
+    query_plan_error: str | None = None
+    used_fallback: bool = False
     tool_sequence: list[str] = field(default_factory=list)  # ReAct 전용
     react_messages: list = field(default_factory=list)      # ReAct 전용 (unnecessary_ingest 판단용)
 
@@ -134,8 +152,12 @@ class PathMetrics:
     """한 경로의 계산된 지표."""
     category_hit: bool = False
     grounding_rate: float = 0.0
+    answer_faithfulness: float = 0.0
     execution_accuracy: float = 0.0     # DB 없으면 0.0 (has_db_eval=False 참고)
     result_f1: float = 0.0              # DB 없으면 0.0
+    precision_at_5: float = 0.0
+    ndcg_at_5: float = 0.0
+    query_plan_accuracy: float = 0.0
     # ReAct 전용 (파이프라인은 항상 기본값)
     tool_recall: float = 0.0
     tool_precision: float = 0.0
@@ -158,10 +180,18 @@ class AggregatedMetrics:
     """케이스 전체 집계."""
     category_hit_rate: float = 0.0
     grounding_rate: float = 0.0
+    answer_faithfulness: float = 0.0
     execution_accuracy: float = 0.0
     result_f1: float = 0.0
+    precision_at_5: float = 0.0
+    ndcg_at_5: float = 0.0
+    query_plan_accuracy: float = 0.0
+    fallback_rate: float = 0.0
     avg_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
     avg_llm_calls: float = 0.0
+    avg_total_tokens: float = 0.0
+    total_estimated_cost: float = 0.0
     # ReAct 전용 (파이프라인은 항상 0.0)
     tool_recall: float = 0.0
     tool_precision: float = 0.0
@@ -215,6 +245,10 @@ class CompareSummary:
                      self.pipeline.grounding_rate,
                      self.react.grounding_rate,
                      self.delta_grounding),
+            _fmt_row("answer_faithfulness",
+                     self.pipeline.answer_faithfulness,
+                     self.react.answer_faithfulness,
+                     self.react.answer_faithfulness - self.pipeline.answer_faithfulness),
             _fmt_row("execution_accuracy (EX)",
                      self.pipeline.execution_accuracy,
                      self.react.execution_accuracy,
@@ -223,17 +257,48 @@ class CompareSummary:
                      self.pipeline.result_f1,
                      self.react.result_f1,
                      self.react.result_f1 - self.pipeline.result_f1),
+            _fmt_row("precision@5",
+                     self.pipeline.precision_at_5,
+                     self.react.precision_at_5,
+                     self.react.precision_at_5 - self.pipeline.precision_at_5),
+            _fmt_row("ndcg@5",
+                     self.pipeline.ndcg_at_5,
+                     self.react.ndcg_at_5,
+                     self.react.ndcg_at_5 - self.pipeline.ndcg_at_5),
             "  " + "-" * 63,
             _fmt_row("avg_latency_ms",
                      self.pipeline.avg_latency_ms,
                      self.react.avg_latency_ms,
                      self.delta_latency_ms,
                      fmt=".1f"),
+            _fmt_row("p95_latency_ms",
+                     self.pipeline.p95_latency_ms,
+                     self.react.p95_latency_ms,
+                     self.react.p95_latency_ms - self.pipeline.p95_latency_ms,
+                     fmt=".1f"),
             _fmt_row("avg_llm_calls",
                      self.pipeline.avg_llm_calls,
                      self.react.avg_llm_calls,
                      self.delta_llm_calls,
                      fmt=".2f"),
+            _fmt_row("avg_total_tokens",
+                     self.pipeline.avg_total_tokens,
+                     self.react.avg_total_tokens,
+                     self.react.avg_total_tokens - self.pipeline.avg_total_tokens,
+                     fmt=".1f"),
+            _fmt_row("total_estimated_cost",
+                     self.pipeline.total_estimated_cost,
+                     self.react.total_estimated_cost,
+                     self.react.total_estimated_cost - self.pipeline.total_estimated_cost,
+                     fmt=".4f"),
+            _fmt_row("fallback_rate",
+                     self.pipeline.fallback_rate,
+                     self.react.fallback_rate,
+                     self.react.fallback_rate - self.pipeline.fallback_rate),
+            _fmt_row("query_plan_accuracy",
+                     self.pipeline.query_plan_accuracy,
+                     self.react.query_plan_accuracy,
+                     self.react.query_plan_accuracy - self.pipeline.query_plan_accuracy),
             "  " + "-" * 63,
             "  [ReAct 전용]",
             _fmt_row("  tool_recall",     None, self.react.tool_recall,             None),
@@ -260,7 +325,22 @@ def _fmt_row(
 # 경로별 실행
 # ---------------------------------------------------------------------------
 
-async def _run_path(graph, query: str, use_react: bool) -> PathResult:
+def _estimate_cost(
+    input_tokens: int,
+    output_tokens: int,
+    input_cost_per_1k: float,
+    output_cost_per_1k: float,
+) -> float:
+    return (input_tokens / 1000) * input_cost_per_1k + (output_tokens / 1000) * output_cost_per_1k
+
+
+async def _run_path(
+    graph,
+    query: str,
+    use_react: bool,
+    input_cost_per_1k: float = 0.0,
+    output_cost_per_1k: float = 0.0,
+) -> PathResult:
     """그래프를 한 경로로 실행하고 PathResult 를 반환한다."""
     t0 = time.perf_counter()
     try:
@@ -271,6 +351,15 @@ async def _run_path(graph, query: str, use_react: bool) -> PathResult:
         return PathResult(latency_ms=latency_ms, error=str(exc))
 
     latency_ms = (time.perf_counter() - t0) * 1000
+    input_tokens = int(state.get("llm_input_tokens", 0) or 0)
+    output_tokens = int(state.get("llm_output_tokens", 0) or 0)
+    total_tokens = int(state.get("llm_total_tokens", input_tokens + output_tokens) or 0)
+    estimated_cost = _estimate_cost(
+        input_tokens,
+        output_tokens,
+        input_cost_per_1k,
+        output_cost_per_1k,
+    )
 
     if use_react:
         msgs = state.get("react_messages") or []
@@ -282,17 +371,31 @@ async def _run_path(graph, query: str, use_react: bool) -> PathResult:
             error=state.get("error"),
             csv_filename=_extract_react_csv(msgs),
             llm_calls=iterations + 1,   # react_act 횟수 + 최종 react_reason 1번
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            estimated_cost=estimated_cost,
             tool_sequence=_extract_tool_sequence(msgs),
             react_messages=msgs,
         )
     else:
+        query_plan_calls = int(state.get("query_plan_llm_calls", 0) or 0)
+        response_calls = int(state.get("response_llm_calls", 1) or 1)
+        query_plan_error = state.get("query_plan_error")
         return PathResult(
             sql_rows=state.get("sql_rows", []),
             response=state.get("response", ""),
             latency_ms=latency_ms,
             error=state.get("error"),
             csv_filename=state.get("csv_filename"),
-            llm_calls=1,    # generate_response 만 LLM 호출
+            llm_calls=query_plan_calls + response_calls,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            estimated_cost=estimated_cost,
+            query_plan=state.get("query_plan"),
+            query_plan_error=query_plan_error,
+            used_fallback=bool(query_plan_error),
         )
 
 
@@ -316,8 +419,13 @@ def _compute_metrics(
 ) -> PathMetrics:
     cat_hit = category_hit(case.csv_filename, path_result.csv_filename)
     ground  = grounding_rate(path_result.response, path_result.sql_rows)
+    faith   = answer_faithfulness(path_result.response, path_result.sql_rows)
     ex      = execution_accuracy(ref_rows, path_result.sql_rows) if ref_rows else 0.0
     f1      = result_f1(ref_rows, path_result.sql_rows)          if ref_rows else 0.0
+    p5      = precision_at_k(ref_rows, path_result.sql_rows, 5)  if ref_rows else 0.0
+    ndcg5   = ndcg_at_k(ref_rows, path_result.sql_rows, 5)       if ref_rows else 0.0
+    expected_plan = getattr(case, "expected_plan", None)
+    plan_acc = query_plan_accuracy(expected_plan, path_result.query_plan) if expected_plan else 0.0
 
     if is_react:
         seq = tool_sequence_metrics(
@@ -329,8 +437,12 @@ def _compute_metrics(
         return PathMetrics(
             category_hit=cat_hit,
             grounding_rate=ground,
+            answer_faithfulness=faith["attribute_faithfulness"],
             execution_accuracy=ex,
             result_f1=f1,
+            precision_at_5=p5,
+            ndcg_at_5=ndcg5,
+            query_plan_accuracy=plan_acc,
             tool_recall=seq["tool_recall"],
             tool_precision=seq["tool_precision"],
             unnecessary_ingest=unnecessary,
@@ -339,8 +451,12 @@ def _compute_metrics(
     return PathMetrics(
         category_hit=cat_hit,
         grounding_rate=ground,
+        answer_faithfulness=faith["attribute_faithfulness"],
         execution_accuracy=ex,
         result_f1=f1,
+        precision_at_5=p5,
+        ndcg_at_5=ndcg5,
+        query_plan_accuracy=plan_acc,
     )
 
 
@@ -360,18 +476,34 @@ def _aggregate(
     pipe_agg = AggregatedMetrics(
         category_hit_rate   = mean([1.0 if m.category_hit else 0.0 for m in pm]),
         grounding_rate      = mean([m.grounding_rate for m in pm]),
+        answer_faithfulness = mean([m.answer_faithfulness for m in pm]),
         execution_accuracy  = mean([m.execution_accuracy for m in pm]),
         result_f1           = mean([m.result_f1 for m in pm]),
+        precision_at_5      = mean([m.precision_at_5 for m in pm]),
+        ndcg_at_5           = mean([m.ndcg_at_5 for m in pm]),
+        query_plan_accuracy = mean([m.query_plan_accuracy for m in pm]),
+        fallback_rate       = fallback_rate([r.used_fallback for r in pr]),
         avg_latency_ms      = mean([r.latency_ms for r in pr]),
+        p95_latency_ms      = percentile([r.latency_ms for r in pr], 95),
         avg_llm_calls       = mean([float(r.llm_calls) for r in pr]),
+        avg_total_tokens    = mean([float(r.total_tokens) for r in pr]),
+        total_estimated_cost = sum(r.estimated_cost for r in pr),
     )
     react_agg = AggregatedMetrics(
         category_hit_rate        = mean([1.0 if m.category_hit else 0.0 for m in rm]),
         grounding_rate           = mean([m.grounding_rate for m in rm]),
+        answer_faithfulness      = mean([m.answer_faithfulness for m in rm]),
         execution_accuracy       = mean([m.execution_accuracy for m in rm]),
         result_f1                = mean([m.result_f1 for m in rm]),
+        precision_at_5           = mean([m.precision_at_5 for m in rm]),
+        ndcg_at_5                = mean([m.ndcg_at_5 for m in rm]),
+        query_plan_accuracy      = mean([m.query_plan_accuracy for m in rm]),
+        fallback_rate            = fallback_rate([r.used_fallback for r in rr]),
         avg_latency_ms           = mean([r.latency_ms for r in rr]),
+        p95_latency_ms           = percentile([r.latency_ms for r in rr], 95),
         avg_llm_calls            = mean([float(r.llm_calls) for r in rr]),
+        avg_total_tokens         = mean([float(r.total_tokens) for r in rr]),
+        total_estimated_cost     = sum(r.estimated_cost for r in rr),
         tool_recall              = mean([m.tool_recall for m in rm]),
         tool_precision           = mean([m.tool_precision for m in rm]),
         unnecessary_ingest_rate  = mean([1.0 if m.unnecessary_ingest else 0.0 for m in rm]),
@@ -388,6 +520,8 @@ async def run_compare_eval(
     cases: list[ReactGoldenCase],
     session_factory: async_sessionmaker | None = None,
     model_name: str = "unknown",
+    input_cost_per_1k: float = 0.0,
+    output_cost_per_1k: float = 0.0,
 ) -> CompareSummary:
     """두 경로를 나란히 실행하고 비교 지표를 반환한다.
 
@@ -402,8 +536,20 @@ async def run_compare_eval(
     for case in cases:
         logger.info("compare eval: %r", case.query)
 
-        pipe_res  = await _run_path(graph, case.query, use_react=False)
-        react_res = await _run_path(graph, case.query, use_react=True)
+        pipe_res  = await _run_path(
+            graph,
+            case.query,
+            use_react=False,
+            input_cost_per_1k=input_cost_per_1k,
+            output_cost_per_1k=output_cost_per_1k,
+        )
+        react_res = await _run_path(
+            graph,
+            case.query,
+            use_react=True,
+            input_cost_per_1k=input_cost_per_1k,
+            output_cost_per_1k=output_cost_per_1k,
+        )
 
         ref_rows = (
             await _fetch_ref_rows(session_factory, case.reference_sql)

@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import math
+
 import sqlglot
 import sqlglot.expressions as exp
 
@@ -75,6 +77,47 @@ def result_f1(ref_rows: list[dict], gen_rows: list[dict]) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def precision_at_k(ref_rows: list[dict], gen_rows: list[dict], k: int) -> float:
+    """Top-k 결과 중 reference id 집합에 포함된 비율."""
+    if k <= 0:
+        return 0.0
+    top = gen_rows[:k]
+    if not top:
+        return 0.0
+    ref_ids = {r.get("id") for r in ref_rows}
+    hits = sum(1 for row in top if row.get("id") in ref_ids)
+    return hits / len(top)
+
+
+def recall_at_k(ref_rows: list[dict], gen_rows: list[dict], k: int) -> float:
+    """Reference id 집합 중 top-k 결과가 회수한 비율."""
+    ref_ids = {r.get("id") for r in ref_rows}
+    if not ref_ids or k <= 0:
+        return 0.0
+    top_ids = {row.get("id") for row in gen_rows[:k]}
+    return len(ref_ids & top_ids) / len(ref_ids)
+
+
+def ndcg_at_k(ref_rows: list[dict], gen_rows: list[dict], k: int) -> float:
+    """Binary relevance 기준 NDCG@k."""
+    if k <= 0:
+        return 0.0
+    ref_ids = {r.get("id") for r in ref_rows}
+    if not ref_ids:
+        return 0.0
+
+    def _dcg(rows: list[dict]) -> float:
+        score = 0.0
+        for idx, row in enumerate(rows[:k], start=1):
+            rel = 1.0 if row.get("id") in ref_ids else 0.0
+            score += rel / math.log2(idx + 1)
+        return score
+
+    ideal_hits = min(len(ref_ids), k)
+    ideal = sum(1.0 / math.log2(idx + 1) for idx in range(1, ideal_hits + 1))
+    return _dcg(gen_rows) / ideal if ideal else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Component Match (진단용)
 # ---------------------------------------------------------------------------
@@ -134,6 +177,75 @@ def mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def percentile(values: list[float], pct: float) -> float:
+    """Nearest-rank style percentile with linear interpolation."""
+    if not values:
+        return 0.0
+    if pct <= 0:
+        return min(values)
+    if pct >= 100:
+        return max(values)
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * (pct / 100)
+    lower = math.floor(pos)
+    upper = math.ceil(pos)
+    if lower == upper:
+        return ordered[int(pos)]
+    weight = pos - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def fallback_rate(flags: list[bool]) -> float:
+    return mean([1.0 if flag else 0.0 for flag in flags])
+
+
+# ---------------------------------------------------------------------------
+# QueryPlan 평가
+# ---------------------------------------------------------------------------
+
+_PLAN_FIELDS = (
+    "csv_filename",
+    "category",
+    "max_price_krw",
+    "min_price_krw",
+    "min_rating",
+    "min_review_count",
+    "brand_include",
+    "brand_exclude",
+    "sort",
+    "limit",
+    "needs_recommendation",
+)
+
+
+def _normalize_plan_value(value):
+    if isinstance(value, list):
+        return sorted(str(v).strip().lower() for v in value if str(v).strip())
+    if isinstance(value, str):
+        return value.strip().lower()
+    return value
+
+
+def query_plan_field_scores(expected: dict, actual: dict | None) -> dict[str, float]:
+    """Expected QueryPlan dict 와 actual QueryPlan dict 의 field-level accuracy."""
+    actual = actual or {}
+    scores: dict[str, float] = {}
+    for field in _PLAN_FIELDS:
+        if field not in expected:
+            continue
+        scores[field] = (
+            1.0
+            if _normalize_plan_value(expected.get(field)) == _normalize_plan_value(actual.get(field))
+            else 0.0
+        )
+    return scores
+
+
+def query_plan_accuracy(expected: dict, actual: dict | None) -> float:
+    scores = query_plan_field_scores(expected, actual)
+    return mean(list(scores.values()))
+
+
 # ---------------------------------------------------------------------------
 # ReAct vs 파이프라인 비교 전용 지표
 # ---------------------------------------------------------------------------
@@ -157,6 +269,75 @@ def grounding_rate(response: str, sql_rows: list[dict]) -> float:
         if (name := row.get("name", "")) and name.lower() in resp_lower
     )
     return mentioned / len(candidates)
+
+
+def answer_faithfulness(response: str, sql_rows: list[dict], exchange_rate: float = 16.0) -> dict[str, float]:
+    """응답이 DB 결과의 상품명/가격/평점을 얼마나 충실히 반영했는지 측정한다.
+
+    문자열 기반의 보수적 지표다. 언급되지 않은 속성은 분모에서 제외한다.
+    """
+    if not sql_rows:
+        return {
+            "grounding_rate": 1.0,
+            "hallucinated_product_rate": 0.0,
+            "price_faithfulness": 1.0,
+            "rating_faithfulness": 1.0,
+            "attribute_faithfulness": 1.0,
+        }
+    if not response:
+        return {
+            "grounding_rate": 0.0,
+            "hallucinated_product_rate": 0.0,
+            "price_faithfulness": 0.0,
+            "rating_faithfulness": 0.0,
+            "attribute_faithfulness": 0.0,
+        }
+
+    resp = response.lower()
+    rows = sql_rows[:10]
+    mentioned = [row for row in rows if (name := row.get("name")) and str(name).lower() in resp]
+    ground = len(mentioned) / len(rows)
+
+    price_checks: list[float] = []
+    rating_checks: list[float] = []
+    for row in mentioned:
+        price = row.get("price")
+        if price is not None:
+            try:
+                krw = int(float(price) * exchange_rate)
+                candidates = {
+                    f"{krw:,}".lower(),
+                    str(krw).lower(),
+                    f"₩{krw:,}".lower(),
+                }
+                if any(candidate in resp for candidate in candidates):
+                    price_checks.append(1.0)
+                elif "₩" in resp or "원" in resp:
+                    price_checks.append(0.0)
+            except (TypeError, ValueError):
+                pass
+
+        rating = row.get("rating")
+        if rating is not None:
+            try:
+                rating_text = f"{float(rating):.1f}".rstrip("0").rstrip(".")
+                if rating_text in resp:
+                    rating_checks.append(1.0)
+                elif "평점" in resp:
+                    rating_checks.append(0.0)
+            except (TypeError, ValueError):
+                pass
+
+    price_score = mean(price_checks) if price_checks else 1.0
+    rating_score = mean(rating_checks) if rating_checks else 1.0
+    return {
+        "grounding_rate": ground,
+        # 상품명 hallucination 은 현재 상품명 추출기가 없으므로 보수적으로 0.0.
+        "hallucinated_product_rate": 0.0,
+        "price_faithfulness": price_score,
+        "rating_faithfulness": rating_score,
+        "attribute_faithfulness": mean([price_score, rating_score]),
+    }
 
 
 def category_hit(expected_csv: str | None, actual_csv: str | None) -> bool:

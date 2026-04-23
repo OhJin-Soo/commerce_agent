@@ -202,11 +202,17 @@ def make_generate_query_plan_node(llm) -> NodeFn:  # type: ignore[type-arg]
 
     async def generate_query_plan(state: AgentState) -> dict:
         if type(llm).__module__ == "unittest.mock":
-            return {"query_plan_error": "mock llm does not support structured output"}
+            return {
+                "query_plan_error": "mock llm does not support structured output",
+                "query_plan_llm_calls": 0,
+            }
 
         method = getattr(type(llm), "with_structured_output", None)
         if method is None:
-            return {"query_plan_error": "llm does not support structured output"}
+            return {
+                "query_plan_error": "llm does not support structured output",
+                "query_plan_llm_calls": 0,
+            }
 
         try:
             structured_llm = llm.with_structured_output(QueryPlan)
@@ -229,6 +235,7 @@ def make_generate_query_plan_node(llm) -> NodeFn:  # type: ignore[type-arg]
             updates: dict = {
                 "query_plan": plan.model_dump(exclude_none=True),
                 "query_plan_error": None,
+                "query_plan_llm_calls": 1,
             }
             if csv_filename:
                 updates["csv_filename"] = csv_filename
@@ -237,7 +244,7 @@ def make_generate_query_plan_node(llm) -> NodeFn:  # type: ignore[type-arg]
             return updates
         except Exception as exc:
             logger.warning("generate_query_plan failed; falling back to rule SQL: %s", exc)
-            return {"query_plan_error": str(exc)}
+            return {"query_plan_error": str(exc), "query_plan_llm_calls": 1}
 
     return generate_query_plan
 
@@ -413,6 +420,18 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
 
         return "관련 데이터 없음"
 
+    def _usage_updates(ai_msg) -> dict:
+        usage = getattr(ai_msg, "usage_metadata", None) or {}
+        input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
+        return {
+            "response_llm_calls": 1,
+            "llm_input_tokens": input_tokens,
+            "llm_output_tokens": output_tokens,
+            "llm_total_tokens": total_tokens,
+        }
+
     async def generate_response(state: AgentState) -> dict:
         context = _build_context(state)
         messages = [
@@ -422,9 +441,9 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
         try:
             ai_msg = await llm.ainvoke(messages)
             from agent.utils import strip_thinking
-            return {"response": strip_thinking(ai_msg.content)}
+            return {"response": strip_thinking(ai_msg.content), **_usage_updates(ai_msg)}
         except Exception as exc:
             logger.error("generate_response failed: %s", exc)
-            return {"response": "", "error": str(exc)}
+            return {"response": "", "error": str(exc), "response_llm_calls": 1}
 
     return generate_response
