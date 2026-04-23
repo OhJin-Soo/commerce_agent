@@ -2,6 +2,8 @@
 
 Examples:
     uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b --path pipeline
+    uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b --path all
+    uv run python eval_models.py --models llama3.1:8b --paths pipeline,query-plan
     uv run python eval_models.py --models llama3.1:8b --path react --no-db-eval
     uv run python eval_models.py --models llama3.1:8b --path query-plan --no-save
 """
@@ -39,9 +41,33 @@ def _parse_models(raw: str) -> list[str]:
     return models
 
 
-def _default_report_paths(output_dir: Path, path: str) -> tuple[Path, Path]:
+_ALL_PATHS = ["pipeline", "react", "query-plan"]
+
+
+def _parse_paths(path: str, paths: str | None) -> list[str]:
+    raw_values = paths if paths is not None else path
+    if raw_values == "all":
+        return list(_ALL_PATHS)
+
+    result = [part.strip() for part in raw_values.split(",") if part.strip()]
+    if "all" in result:
+        return list(_ALL_PATHS)
+
+    invalid = sorted(set(result) - set(_ALL_PATHS))
+    if invalid:
+        raise ValueError(f"invalid path(s): {invalid}. Allowed: {_ALL_PATHS} or all")
+    if not result:
+        raise ValueError("at least one path is required")
+    return result
+
+
+def _path_label(paths: list[str]) -> str:
+    return "all" if paths == _ALL_PATHS else "_".join(paths)
+
+
+def _default_report_paths(output_dir: Path, path_label: str) -> tuple[Path, Path]:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = output_dir / f"model_eval_{path}_{stamp}"
+    base = output_dir / f"model_eval_{path_label}_{stamp}"
     return base.with_suffix(".json"), base.with_suffix(".csv")
 
 
@@ -71,9 +97,13 @@ async def main() -> int:
     )
     parser.add_argument(
         "--path",
-        choices=["pipeline", "react", "query-plan"],
+        choices=["pipeline", "react", "query-plan", "all"],
         default="pipeline",
-        help="Evaluation path to run.",
+        help="Evaluation path to run. Use 'all' for every path.",
+    )
+    parser.add_argument(
+        "--paths",
+        help="Comma-separated paths to run, e.g. pipeline,react,query-plan. Overrides --path.",
     )
     parser.add_argument(
         "--no-db-eval",
@@ -109,14 +139,16 @@ async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     models = _parse_models(args.models)
-    json_path, csv_path = _default_report_paths(Path(args.output_dir), args.path)
+    paths = _parse_paths(args.path, args.paths)
+    path_label = _path_label(paths)
+    json_path, csv_path = _default_report_paths(Path(args.output_dir), path_label)
     if args.json_path:
         json_path = Path(args.json_path)
     if args.csv_path:
         csv_path = Path(args.csv_path)
 
     payload: dict = {
-        "path": args.path,
+        "paths": paths,
         "models": models,
         "runs": [],
     }
@@ -124,41 +156,44 @@ async def main() -> int:
     case_records: list[dict] = []
 
     for model in models:
-        logging.info("Evaluating model=%s path=%s", model, args.path)
+        logging.info("Building graph for model=%s", model)
         graph = await _build_graph(model)
 
-        if args.path == "query-plan":
-            summary = await run_query_plan_eval(graph, model_name=model)
-            run_record, cases = query_plan_summary_to_records(summary)
-        else:
-            summary = await run_path_eval(
-                graph=graph,
-                cases=REACT_GOLDEN_SET,
-                use_react=args.path == "react",
-                session_factory=None if args.no_db_eval else AsyncSessionLocal,
-                model_name=model,
-                input_cost_per_1k=args.input_cost_per_1k,
-                output_cost_per_1k=args.output_cost_per_1k,
+        for eval_path in paths:
+            logging.info("Evaluating model=%s path=%s", model, eval_path)
+
+            if eval_path == "query-plan":
+                summary = await run_query_plan_eval(graph, model_name=model)
+                run_record, cases = query_plan_summary_to_records(summary)
+            else:
+                summary = await run_path_eval(
+                    graph=graph,
+                    cases=REACT_GOLDEN_SET,
+                    use_react=eval_path == "react",
+                    session_factory=None if args.no_db_eval else AsyncSessionLocal,
+                    model_name=model,
+                    input_cost_per_1k=args.input_cost_per_1k,
+                    output_cost_per_1k=args.output_cost_per_1k,
+                )
+                run_record, cases = compare_summary_to_records(summary, eval_path)
+
+            if not args.no_save:
+                run_id = await persist_model_eval(AsyncSessionLocal, run_record, cases)
+                run_record = {**run_record, "id": run_id}
+                logging.info("Persisted model eval run id=%s model=%s path=%s", run_id, model, eval_path)
+
+            run_records.append(run_record)
+            case_records.extend({**case, "model_name": model, "eval_path": eval_path} for case in cases)
+            payload["runs"].append(
+                {
+                    "model_name": model,
+                    "eval_path": eval_path,
+                    "run": run_record,
+                    "cases": cases,
+                }
             )
-            run_record, cases = compare_summary_to_records(summary, args.path)
-
-        if not args.no_save:
-            run_id = await persist_model_eval(AsyncSessionLocal, run_record, cases)
-            run_record = {**run_record, "id": run_id}
-            logging.info("Persisted model eval run id=%s model=%s path=%s", run_id, model, args.path)
-
-        run_records.append(run_record)
-        case_records.extend({**case, "model_name": model, "eval_path": args.path} for case in cases)
-        payload["runs"].append(
-            {
-                "model_name": model,
-                "eval_path": args.path,
-                "run": run_record,
-                "cases": cases,
-            }
-        )
-        print(summary)
-        print()
+            print(summary)
+            print()
 
     export_json(json_path, payload)
     export_csv(csv_path, run_records, case_records)
