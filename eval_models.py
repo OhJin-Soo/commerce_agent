@@ -15,6 +15,7 @@ from datetime import datetime
 import logging
 import os
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
@@ -163,6 +164,12 @@ async def main() -> int:
         "models": models,
         "runs": [],
     }
+    is_batch_run = args.path == "all" or (args.paths is not None and "all" in args.paths.split(","))
+    batch_id = str(uuid4()) if is_batch_run else None
+    if batch_id:
+        payload["batch_id"] = batch_id
+    if batch_id:
+        logging.info("Starting batch eval batch_id=%s", batch_id)
     run_records: list[dict] = []
     case_records: list[dict] = []
 
@@ -199,6 +206,9 @@ async def main() -> int:
                     output_cost_per_1k=args.output_cost_per_1k,
                 )
                 run_record, cases = compare_summary_to_records(summary, eval_path)
+
+            if batch_id:
+                run_record["batch_id"] = batch_id
 
             if not args.no_save and not run_record.get("status") == "skipped":
                 run_id = await persist_model_eval(AsyncSessionLocal, run_record, cases)

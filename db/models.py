@@ -133,6 +133,7 @@ class ModelEvalRun(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    batch_id = Column(Text)
     model_name = Column(Text, nullable=False)
     eval_path = Column(Text, nullable=False)            # pipeline | react | query-plan
     probe_count = Column(Integer, nullable=False)
@@ -165,6 +166,7 @@ class ModelEvalRun(Base):
     cases = relationship("ModelEvalCase", back_populates="run", cascade="all, delete-orphan")
 
     __table_args__ = (
+        Index("ix_model_eval_runs_batch_id", "batch_id"),
         Index("ix_model_eval_runs_model_path_created", "model_name", "eval_path", "created_at"),
     )
 
