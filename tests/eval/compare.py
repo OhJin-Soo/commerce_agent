@@ -401,8 +401,6 @@ class CompareSummary:
             "  [ReAct 전용]",
             _fmt_row("  tool_recall",     None, self.react.tool_recall,             None),
             _fmt_row("  tool_precision",  None, self.react.tool_precision,           None),
-            _fmt_row("  search_web_recall", None, self.react.search_web_recall, None),
-            _fmt_row("  search_web_grounding", None, self.react.search_web_grounding_rate, None),
             _fmt_row("  unnecessary_ingest_rate", None, self.react.unnecessary_ingest_rate, None),
             _fmt_row("  tool_unsupported_rate", None, self.react.tool_unsupported_rate, None),
             _fmt_row("  infra_failure_rate", None, self.react.infra_failure_rate, None),
@@ -837,7 +835,6 @@ class ModelCompareSummary:
                     f"    tool_recall={agg.tool_recall:.1%}"
                     f"  tool_precision={agg.tool_precision:.1%}"
                     f"  tool_arg_acc={agg.tool_argument_accuracy:.1%}"
-                    f"  search_web_recall={agg.search_web_recall:.1%}"
                     f"  unnecessary_ingest={agg.unnecessary_ingest_rate:.1%}"
                     f"  tool_unsupported={agg.tool_unsupported_rate:.1%}"
                     f"  infra_failure={agg.infra_failure_rate:.1%}"

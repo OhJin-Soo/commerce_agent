@@ -23,6 +23,8 @@ from tests.eval.compare import (
     run_model_compare_eval,
     run_path_eval,
 )
+from tests.eval.model_report import compare_summary_to_records, react_web_search_summary_to_records
+from tests.eval.react_web_search_runner import ReactWebSearchCaseResult, ReactWebSearchEvalSummary
 from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics, web_grounding_rate
 from tests.eval.react_golden_set import REACT_GOLDEN_SET, ReactGoldenCase
 
@@ -553,6 +555,54 @@ class TestRunCompareEval:
         )
         assert summary.pipeline.category_hit_rate == pytest.approx(1.0)
         assert summary.react.category_hit_rate == pytest.approx(0.0)
+
+    async def test_react_report_hides_search_web_metrics(self):
+        graph = _make_graph(
+            pipeline_state={"sql_rows": [], "response": "", "csv_filename": "Headphones.csv"},
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Headphones.csv", True),
+                "react_iterations": 3,
+            },
+        )
+        summary = await run_compare_eval(graph, REACT_GOLDEN_SET[:1], session_factory=None)
+        run, cases = compare_summary_to_records(summary, "react")
+        assert "search_web_recall" not in run
+        assert "search_web_grounding_rate" not in run
+        assert "search_web_recall" not in cases[0]
+        assert "search_web_grounding_rate" not in cases[0]
+
+
+class TestReactWebSearchReport:
+    def test_dedicated_report_exposes_search_web_metrics(self):
+        summary = ReactWebSearchEvalSummary(
+            model_name="test-model",
+            n=1,
+            search_web_recall=1.0,
+            search_success_rate=1.0,
+            avg_source_count=2.0,
+            grounding_rate=0.5,
+            avg_latency_ms=10.0,
+            p95_latency_ms=10.0,
+            avg_llm_calls=2.0,
+            avg_total_tokens=100.0,
+            tool_unsupported_rate=0.0,
+            infra_failure_rate=0.0,
+            cases=[
+                ReactWebSearchCaseResult(
+                    query="Sony WH-1000XM5 리뷰",
+                    search_web_called=True,
+                    search_query="Sony WH-1000XM5 리뷰",
+                    result_count=2,
+                    response="요약",
+                    grounding_rate=0.5,
+                )
+            ],
+        )
+        run, cases = react_web_search_summary_to_records(summary)
+        assert run["search_web_recall"] == pytest.approx(1.0)
+        assert cases[0]["search_web_called"] is True
+        assert cases[0]["result_count"] == 2
 
 
 # ---------------------------------------------------------------------------
