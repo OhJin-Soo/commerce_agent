@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
 
 from agent import GraphDeps, build_graph
+from agent.nodes import make_generate_query_plan_node, make_generate_response_node, make_web_search_node
 from db.currency import fetch_inr_to_krw
 from db.session import AsyncSessionLocal
 from tests.eval.compare import run_path_eval
@@ -29,9 +30,11 @@ from tests.eval.model_report import (
     export_json,
     persist_model_eval,
     query_plan_summary_to_records,
+    web_search_summary_to_records,
 )
 from tests.eval.query_plan_runner import run_query_plan_eval
 from tests.eval.react_golden_set import REACT_GOLDEN_SET
+from tests.eval.web_search_runner import run_web_search_eval
 
 
 def _parse_models(raw: str) -> list[str]:
@@ -41,7 +44,7 @@ def _parse_models(raw: str) -> list[str]:
     return models
 
 
-_ALL_PATHS = ["pipeline", "react", "query-plan"]
+_ALL_PATHS = ["pipeline", "react", "query-plan", "web-search"]
 
 
 def _parse_paths(path: str, paths: str | None) -> list[str]:
@@ -76,15 +79,21 @@ async def _build_graph(model: str):
     ingest_nrows = int(os.getenv("KAGGLE_NROWS", "50000"))
     tavily_api_key = os.getenv("TAVILY_API_KEY") or None
     exchange_rate = await fetch_inr_to_krw()
+    llm = ChatOllama(model=model)
     deps = GraphDeps(
         session_factory=AsyncSessionLocal,
-        llm=ChatOllama(model=model),
+        llm=llm,
         dataset_handle=dataset_handle,
         ingest_nrows=ingest_nrows,
         exchange_rate=exchange_rate,
         tavily_api_key=tavily_api_key,
     )
-    return build_graph(deps)
+    return {
+        "graph": build_graph(deps),
+        "query_plan_node": make_generate_query_plan_node(llm),
+        "web_search_node": make_web_search_node(tavily_api_key),
+        "response_node": make_generate_response_node(llm, exchange_rate=exchange_rate),
+    }
 
 
 async def main() -> int:
@@ -97,7 +106,7 @@ async def main() -> int:
     )
     parser.add_argument(
         "--path",
-        choices=["pipeline", "react", "query-plan", "all"],
+        choices=["pipeline", "react", "query-plan", "web-search", "all"],
         default="pipeline",
         help="Evaluation path to run. Use 'all' for every path.",
     )
@@ -157,14 +166,22 @@ async def main() -> int:
 
     for model in models:
         logging.info("Building graph for model=%s", model)
-        graph = await _build_graph(model)
+        runtime = await _build_graph(model)
+        graph = runtime["graph"]
 
         for eval_path in paths:
             logging.info("Evaluating model=%s path=%s", model, eval_path)
 
             if eval_path == "query-plan":
-                summary = await run_query_plan_eval(graph, model_name=model)
+                summary = await run_query_plan_eval(runtime["query_plan_node"], model_name=model)
                 run_record, cases = query_plan_summary_to_records(summary)
+            elif eval_path == "web-search":
+                summary = await run_web_search_eval(
+                    runtime["web_search_node"],
+                    runtime["response_node"],
+                    model_name=model,
+                )
+                run_record, cases = web_search_summary_to_records(summary)
             else:
                 summary = await run_path_eval(
                     graph=graph,

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from db.models import ModelEvalCase, ModelEvalRun
 from tests.eval.compare import CompareSummary
 from tests.eval.query_plan_runner import QueryPlanEvalSummary
+from tests.eval.web_search_runner import WebSearchEvalSummary
 
 
 def _jsonable(value: Any) -> Any:
@@ -116,6 +117,35 @@ def query_plan_summary_to_records(summary: QueryPlanEvalSummary) -> tuple[dict, 
             "total_tokens": case.total_tokens,
             "expected_plan": case.expected_plan,
             "actual_plan": case.actual_plan,
+            "raw_json": _jsonable(case),
+        }
+        for case in summary.cases
+    ]
+    return run, cases
+
+
+def web_search_summary_to_records(summary: WebSearchEvalSummary) -> tuple[dict, list[dict]]:
+    run = {
+        "model_name": summary.model_name,
+        "eval_path": "web-search",
+        "probe_count": summary.n,
+        "has_db_eval": False,
+        "grounding_rate": summary.grounding_rate,
+        "avg_latency_ms": summary.avg_latency_ms,
+        "p95_latency_ms": summary.p95_latency_ms,
+        "avg_llm_calls": summary.avg_llm_calls,
+        "avg_total_tokens": summary.avg_total_tokens,
+        "summary_json": _jsonable(summary),
+    }
+    cases = [
+        {
+            "query": case.query,
+            "response": case.response,
+            "error_msg": case.error,
+            "grounding_rate": case.grounding_rate,
+            "latency_ms": case.latency_ms,
+            "llm_calls": case.llm_calls,
+            "total_tokens": case.total_tokens,
             "raw_json": _jsonable(case),
         }
         for case in summary.cases

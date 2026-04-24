@@ -8,13 +8,11 @@ from tests.eval.query_plan_golden_set import QueryPlanGoldenCase
 from tests.eval.query_plan_runner import run_query_plan_eval
 
 
-def _make_graph(states: list[dict]) -> MagicMock:
-    async def ainvoke(_state: dict):
+def _make_query_plan_node(states: list[dict]) -> MagicMock:
+    async def node(_state: dict):
         return states.pop(0)
 
-    graph = MagicMock()
-    graph.ainvoke = ainvoke
-    return graph
+    return MagicMock(side_effect=node)
 
 
 class TestQueryPlanRunner:
@@ -25,7 +23,7 @@ class TestQueryPlanRunner:
             "max_price_krw": 50_000,
             "sort": "rating_desc",
         }
-        graph = _make_graph([
+        node = _make_query_plan_node([
             {
                 "query_plan": expected,
                 "query_plan_error": None,
@@ -35,7 +33,7 @@ class TestQueryPlanRunner:
         ])
 
         summary = await run_query_plan_eval(
-            graph,
+            node,
             cases=[QueryPlanGoldenCase("이어폰 5만원 이하", expected)],
             model_name="test-model",
         )
@@ -49,7 +47,7 @@ class TestQueryPlanRunner:
 
     async def test_fallback_counts_as_fallback(self):
         expected = {"csv_filename": "Headphones.csv", "max_price_krw": 50_000}
-        graph = _make_graph([
+        node = _make_query_plan_node([
             {
                 "query_plan": None,
                 "query_plan_error": "structured output failed",
@@ -58,7 +56,7 @@ class TestQueryPlanRunner:
         ])
 
         summary = await run_query_plan_eval(
-            graph,
+            node,
             cases=[QueryPlanGoldenCase("이어폰 5만원 이하", expected)],
         )
 

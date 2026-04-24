@@ -340,6 +340,22 @@ def answer_faithfulness(response: str, sql_rows: list[dict], exchange_rate: floa
     }
 
 
+def web_grounding_rate(response: str, web_results: list[dict]) -> float:
+    """응답이 웹 검색 결과의 source title을 얼마나 반영했는지 측정한다."""
+    if not web_results:
+        return 1.0
+    if not response:
+        return 0.0
+    resp = response.lower()
+    hits = 0
+    candidates = web_results[:5]
+    for row in candidates:
+        title = str(row.get("title", "")).strip().lower()
+        if title and title in resp:
+            hits += 1
+    return hits / len(candidates)
+
+
 def category_hit(expected_csv: str | None, actual_csv: str | None) -> bool:
     """두 경로가 동일한 CSV 파일(카테고리)을 선택했는가.
 

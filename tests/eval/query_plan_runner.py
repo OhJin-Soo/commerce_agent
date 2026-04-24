@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from tests.eval.metrics import (
     fallback_rate,
@@ -15,6 +16,8 @@ from tests.eval.metrics import (
 from tests.eval.query_plan_golden_set import QUERY_PLAN_GOLDEN_SET, QueryPlanGoldenCase
 
 logger = logging.getLogger(__name__)
+
+QueryPlanNode = Callable[[dict], Awaitable[dict]]
 
 
 @dataclass
@@ -60,10 +63,10 @@ class QueryPlanEvalSummary:
         return "\n".join(lines)
 
 
-async def _run_case(graph, case: QueryPlanGoldenCase) -> QueryPlanCaseResult:
+async def _run_case(query_plan_node: QueryPlanNode, case: QueryPlanGoldenCase) -> QueryPlanCaseResult:
     t0 = time.perf_counter()
     try:
-        state: dict = await graph.ainvoke({"query": case.query, "use_react": False})
+        state: dict = await query_plan_node({"query": case.query})
     except Exception as exc:
         latency_ms = (time.perf_counter() - t0) * 1000
         logger.exception("query plan eval failed: query=%r", case.query)
@@ -94,12 +97,12 @@ async def _run_case(graph, case: QueryPlanGoldenCase) -> QueryPlanCaseResult:
 
 
 async def run_query_plan_eval(
-    graph,
+    query_plan_node: QueryPlanNode,
     cases: list[QueryPlanGoldenCase] | None = None,
     model_name: str = "unknown",
 ) -> QueryPlanEvalSummary:
     probes = cases or QUERY_PLAN_GOLDEN_SET
-    results = [await _run_case(graph, case) for case in probes]
+    results = [await _run_case(query_plan_node, case) for case in probes]
 
     field_names = sorted({name for result in results for name in result.field_scores})
     field_accuracy = {
