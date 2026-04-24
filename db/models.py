@@ -139,6 +139,8 @@ class ModelEvalRun(Base):
     has_db_eval = Column(Boolean, nullable=False, default=False)
 
     category_hit_rate = Column(Float)
+    search_success_rate = Column(Float)
+    avg_source_count = Column(Float)
     grounding_rate = Column(Float)
     answer_faithfulness = Column(Float)
     execution_accuracy = Column(Float)

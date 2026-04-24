@@ -41,9 +41,18 @@ class WebSearchEvalSummary:
     p95_latency_ms: float
     avg_llm_calls: float
     avg_total_tokens: float
+    skipped: bool = False
+    skip_reason: str | None = None
     cases: list[WebSearchCaseResult] = field(default_factory=list)
 
     def __str__(self) -> str:
+        if self.skipped:
+            return "\n".join(
+                [
+                    f"=== WebSearchEvalSummary [{self.model_name}] (skipped) ===",
+                    f"  reason             : {self.skip_reason or 'unknown'}",
+                ]
+            )
         return "\n".join(
             [
                 f"=== WebSearchEvalSummary [{self.model_name}] (n={self.n}) ===",
@@ -56,6 +65,23 @@ class WebSearchEvalSummary:
                 f"  avg_total_tokens   : {self.avg_total_tokens:.1f}",
             ]
         )
+
+
+def make_skipped_web_search_eval(model_name: str, reason: str) -> WebSearchEvalSummary:
+    return WebSearchEvalSummary(
+        model_name=model_name,
+        n=0,
+        search_success_rate=0.0,
+        avg_source_count=0.0,
+        grounding_rate=0.0,
+        avg_latency_ms=0.0,
+        p95_latency_ms=0.0,
+        avg_llm_calls=0.0,
+        avg_total_tokens=0.0,
+        skipped=True,
+        skip_reason=reason,
+        cases=[],
+    )
 
 
 async def _run_case(

@@ -5,7 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.eval.web_search_golden_set import WebSearchGoldenCase
-from tests.eval.web_search_runner import run_web_search_eval
+from tests.eval.model_report import web_search_summary_to_records
+from tests.eval.web_search_runner import make_skipped_web_search_eval, run_web_search_eval
 
 
 def _make_node(states: list[dict]) -> MagicMock:
@@ -52,3 +53,23 @@ class TestWebSearchRunner:
             cases=[WebSearchGoldenCase("이어폰 후기", min_results=1)],
         )
         assert summary.search_success_rate == pytest.approx(0.0)
+
+    def test_skipped_summary_marks_reason(self):
+        summary = make_skipped_web_search_eval("test-model", "missing_tavily_api_key")
+
+        assert summary.skipped is True
+        assert summary.skip_reason == "missing_tavily_api_key"
+        assert "skipped" in str(summary)
+
+    def test_report_exposes_web_search_metrics(self):
+        summary = make_skipped_web_search_eval("test-model", "missing_tavily_api_key")
+        summary.search_success_rate = 0.75
+        summary.avg_source_count = 2.5
+
+        run, cases = web_search_summary_to_records(summary)
+
+        assert run["search_success_rate"] == pytest.approx(0.75)
+        assert run["avg_source_count"] == pytest.approx(2.5)
+        assert run["status"] == "skipped"
+        assert run["skip_reason"] == "missing_tavily_api_key"
+        assert cases == []

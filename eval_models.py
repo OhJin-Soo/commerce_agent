@@ -35,6 +35,7 @@ from tests.eval.model_report import (
 from tests.eval.query_plan_runner import run_query_plan_eval
 from tests.eval.react_golden_set import REACT_GOLDEN_SET
 from tests.eval.web_search_runner import run_web_search_eval
+from tests.eval.web_search_runner import make_skipped_web_search_eval
 
 
 def _parse_models(raw: str) -> list[str]:
@@ -93,6 +94,7 @@ async def _build_graph(model: str):
         "query_plan_node": make_generate_query_plan_node(llm),
         "web_search_node": make_web_search_node(tavily_api_key),
         "response_node": make_generate_response_node(llm, exchange_rate=exchange_rate),
+        "tavily_enabled": bool(tavily_api_key),
     }
 
 
@@ -176,11 +178,15 @@ async def main() -> int:
                 summary = await run_query_plan_eval(runtime["query_plan_node"], model_name=model)
                 run_record, cases = query_plan_summary_to_records(summary)
             elif eval_path == "web-search":
-                summary = await run_web_search_eval(
-                    runtime["web_search_node"],
-                    runtime["response_node"],
-                    model_name=model,
-                )
+                if runtime["tavily_enabled"]:
+                    summary = await run_web_search_eval(
+                        runtime["web_search_node"],
+                        runtime["response_node"],
+                        model_name=model,
+                    )
+                else:
+                    logging.warning("Skipping web-search eval for model=%s: missing TAVILY_API_KEY", model)
+                    summary = make_skipped_web_search_eval(model, "missing_tavily_api_key")
                 run_record, cases = web_search_summary_to_records(summary)
             else:
                 summary = await run_path_eval(
@@ -194,7 +200,7 @@ async def main() -> int:
                 )
                 run_record, cases = compare_summary_to_records(summary, eval_path)
 
-            if not args.no_save:
+            if not args.no_save and not run_record.get("status") == "skipped":
                 run_id = await persist_model_eval(AsyncSessionLocal, run_record, cases)
                 run_record = {**run_record, "id": run_id}
                 logging.info("Persisted model eval run id=%s model=%s path=%s", run_id, model, eval_path)
