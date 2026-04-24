@@ -67,6 +67,7 @@ from tests.eval.metrics import (
     percentile,
     precision_at_k,
     query_plan_accuracy,
+    react_tool_argument_accuracy,
     result_f1,
     tool_sequence_metrics,
 )
@@ -90,6 +91,85 @@ def _extract_tool_sequence(react_messages: list) -> list[str]:
         if name and getattr(m, "tool_call_id", None) is not None:
             result.append(name)
     return result
+
+
+def _extract_tool_args(react_messages: list, tool_name: str) -> dict | None:
+    """AIMessage.tool_calls 에서 특정 도구의 마지막 args 를 추출한다."""
+    for m in reversed(react_messages):
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in reversed(tool_calls):
+            if tc.get("name") == tool_name:
+                args = tc.get("args")
+                return args if isinstance(args, dict) else None
+    return None
+
+
+def _extract_search_web_queries(react_messages: list) -> list[str]:
+    queries: list[str] = []
+    for m in react_messages:
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in tool_calls:
+            if tc.get("name") != "search_web":
+                continue
+            args = tc.get("args")
+            if isinstance(args, dict):
+                query = args.get("query")
+                if isinstance(query, str) and query.strip():
+                    queries.append(query.strip())
+    return queries
+
+
+def _extract_search_web_results(react_messages: list) -> list[dict]:
+    results: list[dict] = []
+    for m in react_messages:
+        if getattr(m, "name", None) != "search_web":
+            continue
+        try:
+            data = json.loads(getattr(m, "content", "{}"))
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+        items = data.get("results")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    results.append(item)
+    return results
+
+
+def _classify_error_status(error: str | None, react_messages: list | None = None) -> str | None:
+    """에러를 tool 지원/인프라/일반 실행 실패로 분류한다."""
+    haystacks = []
+    if error:
+        haystacks.append(error)
+    for message in react_messages or []:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            lower = content.lower()
+            if any(marker in lower for marker in ('"error"', '"message"', "error", "failed", "exception", "tavily_api_key")):
+                haystacks.append(content)
+    text_blob = " ".join(haystacks).lower()
+    if not text_blob.strip():
+        return None
+    if "does not support tools" in text_blob or "tool support" in text_blob:
+        return "tool_unsupported"
+    infra_markers = (
+        "tavily_api_key",
+        "connection refused",
+        "timeout",
+        "timed out",
+        "name or service not known",
+        "failed to connect",
+        "could not connect",
+        "temporary failure",
+        "network",
+        "dns",
+        "api key",
+        "authentication",
+        "permission denied",
+    )
+    if any(marker in text_blob for marker in infra_markers):
+        return "infra_failure"
+    return "execution_failure"
 
 
 def _extract_react_csv(react_messages: list) -> str | None:
@@ -143,6 +223,10 @@ class PathResult:
     query_plan: dict | None = None
     query_plan_error: str | None = None
     used_fallback: bool = False
+    error_status: str | None = None
+    tool_arguments: dict[str, dict] = field(default_factory=dict)
+    web_results: list[dict] = field(default_factory=list)
+    search_web_queries: list[str] = field(default_factory=list)
     tool_sequence: list[str] = field(default_factory=list)  # ReAct 전용
     react_messages: list = field(default_factory=list)      # ReAct 전용 (unnecessary_ingest 판단용)
 
@@ -158,10 +242,15 @@ class PathMetrics:
     precision_at_5: float = 0.0
     ndcg_at_5: float = 0.0
     query_plan_accuracy: float = 0.0
+    tool_argument_accuracy: float = 0.0
+    search_web_recall: float = 0.0
+    search_web_grounding_rate: float = 0.0
     # ReAct 전용 (파이프라인은 항상 기본값)
     tool_recall: float = 0.0
     tool_precision: float = 0.0
     unnecessary_ingest: bool = False
+    tool_unsupported: bool = False
+    infra_failure: bool = False
 
 
 @dataclass
@@ -186,6 +275,9 @@ class AggregatedMetrics:
     precision_at_5: float = 0.0
     ndcg_at_5: float = 0.0
     query_plan_accuracy: float = 0.0
+    tool_argument_accuracy: float = 0.0
+    search_web_recall: float = 0.0
+    search_web_grounding_rate: float = 0.0
     fallback_rate: float = 0.0
     avg_latency_ms: float = 0.0
     p95_latency_ms: float = 0.0
@@ -196,6 +288,8 @@ class AggregatedMetrics:
     tool_recall: float = 0.0
     tool_precision: float = 0.0
     unnecessary_ingest_rate: float = 0.0
+    tool_unsupported_rate: float = 0.0
+    infra_failure_rate: float = 0.0
 
 
 @dataclass
@@ -299,11 +393,19 @@ class CompareSummary:
                      self.pipeline.query_plan_accuracy,
                      self.react.query_plan_accuracy,
                      self.react.query_plan_accuracy - self.pipeline.query_plan_accuracy),
+            _fmt_row("tool_argument_accuracy",
+                     self.pipeline.tool_argument_accuracy,
+                     self.react.tool_argument_accuracy,
+                     self.react.tool_argument_accuracy - self.pipeline.tool_argument_accuracy),
             "  " + "-" * 63,
             "  [ReAct 전용]",
             _fmt_row("  tool_recall",     None, self.react.tool_recall,             None),
             _fmt_row("  tool_precision",  None, self.react.tool_precision,           None),
+            _fmt_row("  search_web_recall", None, self.react.search_web_recall, None),
+            _fmt_row("  search_web_grounding", None, self.react.search_web_grounding_rate, None),
             _fmt_row("  unnecessary_ingest_rate", None, self.react.unnecessary_ingest_rate, None),
+            _fmt_row("  tool_unsupported_rate", None, self.react.tool_unsupported_rate, None),
+            _fmt_row("  infra_failure_rate", None, self.react.infra_failure_rate, None),
         ]
         return "\n".join(lines)
 
@@ -375,6 +477,13 @@ async def _run_path(
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             estimated_cost=estimated_cost,
+            error_status=_classify_error_status(state.get("error"), msgs),
+            tool_arguments={
+                "query_products": _extract_tool_args(msgs, "query_products") or {},
+                "search_web": _extract_tool_args(msgs, "search_web") or {},
+            },
+            web_results=_extract_search_web_results(msgs),
+            search_web_queries=_extract_search_web_queries(msgs),
             tool_sequence=_extract_tool_sequence(msgs),
             react_messages=msgs,
         )
@@ -426,6 +535,19 @@ def _compute_metrics(
     ndcg5   = ndcg_at_k(ref_rows, path_result.sql_rows, 5)       if ref_rows else 0.0
     expected_plan = getattr(case, "expected_plan", None)
     plan_acc = query_plan_accuracy(expected_plan, path_result.query_plan) if expected_plan else 0.0
+    expected_query_products_args = getattr(case, "expected_query_products_args", None)
+    tool_arg_acc = (
+        react_tool_argument_accuracy(expected_query_products_args, path_result.tool_arguments.get("query_products"))
+        if expected_query_products_args and is_react
+        else 0.0
+    )
+    expected_search_web = bool(getattr(case, "expects_search_web", False))
+    search_web_called = "search_web" in path_result.tool_sequence
+    search_web_recall = 1.0 if (not expected_search_web or search_web_called) else 0.0
+    search_web_ground = 0.0
+    if is_react and search_web_called:
+        from tests.eval.metrics import web_grounding_rate
+        search_web_ground = web_grounding_rate(path_result.response, path_result.web_results)
 
     if is_react:
         seq = tool_sequence_metrics(
@@ -443,9 +565,14 @@ def _compute_metrics(
             precision_at_5=p5,
             ndcg_at_5=ndcg5,
             query_plan_accuracy=plan_acc,
+            tool_argument_accuracy=tool_arg_acc,
+            search_web_recall=search_web_recall,
+            search_web_grounding_rate=search_web_ground,
             tool_recall=seq["tool_recall"],
             tool_precision=seq["tool_precision"],
             unnecessary_ingest=unnecessary,
+            tool_unsupported=path_result.error_status == "tool_unsupported",
+            infra_failure=path_result.error_status == "infra_failure",
         )
 
     return PathMetrics(
@@ -482,6 +609,9 @@ def _aggregate(
         precision_at_5      = mean([m.precision_at_5 for m in pm]),
         ndcg_at_5           = mean([m.ndcg_at_5 for m in pm]),
         query_plan_accuracy = mean([m.query_plan_accuracy for m in pm]),
+        tool_argument_accuracy = mean([m.tool_argument_accuracy for m in pm]),
+        search_web_recall   = mean([m.search_web_recall for m in pm]),
+        search_web_grounding_rate = mean([m.search_web_grounding_rate for m in pm]),
         fallback_rate       = fallback_rate([r.used_fallback for r in pr]),
         avg_latency_ms      = mean([r.latency_ms for r in pr]),
         p95_latency_ms      = percentile([r.latency_ms for r in pr], 95),
@@ -498,6 +628,9 @@ def _aggregate(
         precision_at_5           = mean([m.precision_at_5 for m in rm]),
         ndcg_at_5                = mean([m.ndcg_at_5 for m in rm]),
         query_plan_accuracy      = mean([m.query_plan_accuracy for m in rm]),
+        tool_argument_accuracy   = mean([m.tool_argument_accuracy for m in rm]),
+        search_web_recall        = mean([m.search_web_recall for m in rm]),
+        search_web_grounding_rate = mean([m.search_web_grounding_rate for m in rm]),
         fallback_rate            = fallback_rate([r.used_fallback for r in rr]),
         avg_latency_ms           = mean([r.latency_ms for r in rr]),
         p95_latency_ms           = percentile([r.latency_ms for r in rr], 95),
@@ -507,6 +640,8 @@ def _aggregate(
         tool_recall              = mean([m.tool_recall for m in rm]),
         tool_precision           = mean([m.tool_precision for m in rm]),
         unnecessary_ingest_rate  = mean([1.0 if m.unnecessary_ingest else 0.0 for m in rm]),
+        tool_unsupported_rate    = mean([1.0 if m.tool_unsupported else 0.0 for m in rm]),
+        infra_failure_rate       = mean([1.0 if m.infra_failure else 0.0 for m in rm]),
     )
     return pipe_agg, react_agg
 
@@ -701,7 +836,11 @@ class ModelCompareSummary:
                 lines.append(
                     f"    tool_recall={agg.tool_recall:.1%}"
                     f"  tool_precision={agg.tool_precision:.1%}"
+                    f"  tool_arg_acc={agg.tool_argument_accuracy:.1%}"
+                    f"  search_web_recall={agg.search_web_recall:.1%}"
                     f"  unnecessary_ingest={agg.unnecessary_ingest_rate:.1%}"
+                    f"  tool_unsupported={agg.tool_unsupported_rate:.1%}"
+                    f"  infra_failure={agg.infra_failure_rate:.1%}"
                 )
             lines.append("")
         best = self.best_model()

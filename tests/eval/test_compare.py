@@ -12,6 +12,9 @@ from tests.eval.compare import (
     ModelCompareSummary,
     PathMetrics,
     PathResult,
+    _classify_error_status,
+    _extract_search_web_queries,
+    _extract_tool_args,
     _compute_metrics,
     _extract_react_csv,
     _extract_tool_sequence,
@@ -20,7 +23,7 @@ from tests.eval.compare import (
     run_model_compare_eval,
     run_path_eval,
 )
-from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics
+from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics, web_grounding_rate
 from tests.eval.react_golden_set import REACT_GOLDEN_SET, ReactGoldenCase
 
 
@@ -63,6 +66,13 @@ class TestGroundingRate:
         # Product0~9 만 언급 (10개), Product10~14 는 미언급
         response = " ".join(f"Product{i}" for i in range(10))
         assert grounding_rate(response, rows) == pytest.approx(1.0)
+
+
+class TestWebGroundingRate:
+    def test_title_overlap_counts_as_grounded(self):
+        results = [{"title": "Sony WH-1000XM5 리뷰", "url": "https://example.com/review"}]
+        response = "Sony WH-1000XM5는 착용감과 노이즈 캔슬링 평가가 좋습니다."
+        assert web_grounding_rate(response, results) == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +178,22 @@ class TestExtractToolSequence:
         assert _extract_tool_sequence([]) == []
 
 
+class TestExtractToolArgs:
+    def test_extracts_last_tool_args_from_ai_message(self):
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "query_products", "args": {"csv_filename": "Headphones.csv", "limit": 10}, "id": "1", "type": "tool_call"},
+        ])
+        assert _extract_tool_args([ai], "query_products") == {"csv_filename": "Headphones.csv", "limit": 10}
+
+
+class TestExtractSearchWebQueries:
+    def test_extracts_search_web_queries(self):
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "search_web", "args": {"query": "Sony WH-1000XM5 리뷰"}, "id": "1", "type": "tool_call"},
+        ])
+        assert _extract_search_web_queries([ai]) == ["Sony WH-1000XM5 리뷰"]
+
+
 class TestExtractReactCsv:
     def test_extracts_csv_from_search_category(self):
         msgs = [
@@ -214,6 +240,14 @@ class TestWasIngestUnnecessary:
         assert _was_ingest_unnecessary([]) is False
 
 
+class TestClassifyErrorStatus:
+    def test_tool_unsupported(self):
+        assert _classify_error_status("model does not support tools", []) == "tool_unsupported"
+
+    def test_infra_failure(self):
+        assert _classify_error_status("TAVILY_API_KEY missing", []) == "infra_failure"
+
+
 # ---------------------------------------------------------------------------
 # _compute_metrics
 # ---------------------------------------------------------------------------
@@ -226,6 +260,7 @@ class TestComputeMetrics:
             required_tools=["search_category", "check_db_loaded", "query_products"],
             optional_tools=[],
             reference_sql="SELECT 1",
+            expected_query_products_args={"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10},
         )
 
     def test_pipeline_category_hit(self):
@@ -253,6 +288,34 @@ class TestComputeMetrics:
         )
         m = _compute_metrics(result, [], self._case(), is_react=True)
         assert m.tool_recall == pytest.approx(2 / 3)
+
+    def test_react_tool_argument_accuracy(self):
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "query_products", "args": {"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10}, "id": "1", "type": "tool_call"},
+        ])
+        result = PathResult(
+            csv_filename="Headphones.csv",
+            response="",
+            sql_rows=[],
+            tool_sequence=["search_category", "check_db_loaded", "query_products"],
+            react_messages=[ai],
+            tool_arguments={"query_products": {"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10}},
+        )
+        m = _compute_metrics(result, [], self._case(), is_react=True)
+        assert m.tool_argument_accuracy == pytest.approx(1.0)
+
+    def test_react_error_status_flags(self):
+        result = PathResult(
+            csv_filename=None,
+            response="",
+            sql_rows=[],
+            error_status="tool_unsupported",
+            tool_sequence=[],
+            react_messages=[],
+        )
+        m = _compute_metrics(result, [], self._case(), is_react=True)
+        assert m.tool_unsupported is True
+        assert m.infra_failure is False
 
     def test_react_unnecessary_ingest_detected(self):
         msgs = [

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import math
+import re
+from urllib.parse import urlparse
 
 import sqlglot
 import sqlglot.expressions as exp
@@ -341,7 +343,10 @@ def answer_faithfulness(response: str, sql_rows: list[dict], exchange_rate: floa
 
 
 def web_grounding_rate(response: str, web_results: list[dict]) -> float:
-    """응답이 웹 검색 결과의 source title을 얼마나 반영했는지 측정한다."""
+    """응답이 웹 검색 결과의 source title/url을 얼마나 반영했는지 측정한다.
+
+    exact title match 대신 title token overlap 또는 source URL/domain mention을 허용한다.
+    """
     if not web_results:
         return 1.0
     if not response:
@@ -349,11 +354,35 @@ def web_grounding_rate(response: str, web_results: list[dict]) -> float:
     resp = response.lower()
     hits = 0
     candidates = web_results[:5]
+
+    def _tokens(text: str) -> set[str]:
+        parts = re.findall(r"[0-9a-zA-Z가-힣]+", text.lower())
+        return {
+            token for token in parts
+            if len(token) >= 2 and token not in {"리뷰", "후기", "사용자", "평가", "좋은", "대한", "the", "and"}
+        }
+
     for row in candidates:
         title = str(row.get("title", "")).strip().lower()
-        if title and title in resp:
+        url = str(row.get("url", "")).strip().lower()
+        hostname = urlparse(url).hostname or ""
+        hostname = hostname.removeprefix("www.")
+        title_tokens = _tokens(title)
+        resp_tokens = _tokens(resp)
+        overlap = len(title_tokens & resp_tokens) / len(title_tokens) if title_tokens else 0.0
+        if (
+            (title and title in resp)
+            or (hostname and hostname in resp)
+            or (url and url in resp)
+            or overlap >= 0.4
+        ):
             hits += 1
     return hits / len(candidates)
+
+
+def react_tool_argument_accuracy(expected: dict, actual: dict | None) -> float:
+    """ReAct tool args 와 기대 인자의 field-level accuracy."""
+    return query_plan_accuracy(expected, actual)
 
 
 def category_hit(expected_csv: str | None, actual_csv: str | None) -> bool:

@@ -31,12 +31,14 @@ from tests.eval.model_report import (
     export_json,
     persist_model_eval,
     query_plan_summary_to_records,
+    react_web_search_summary_to_records,
     web_search_summary_to_records,
 )
 from tests.eval.query_plan_runner import run_query_plan_eval
 from tests.eval.react_golden_set import REACT_GOLDEN_SET
-from tests.eval.web_search_runner import run_web_search_eval
+from tests.eval.react_web_search_runner import run_react_web_search_eval
 from tests.eval.web_search_runner import make_skipped_web_search_eval
+from tests.eval.web_search_runner import run_web_search_eval
 
 
 def _parse_models(raw: str) -> list[str]:
@@ -46,7 +48,7 @@ def _parse_models(raw: str) -> list[str]:
     return models
 
 
-_ALL_PATHS = ["pipeline", "react", "query-plan", "web-search"]
+_ALL_PATHS = ["pipeline", "react", "query-plan", "web-search", "react-web-search"]
 
 
 def _parse_paths(path: str, paths: str | None) -> list[str]:
@@ -109,7 +111,7 @@ async def main() -> int:
     )
     parser.add_argument(
         "--path",
-        choices=["pipeline", "react", "query-plan", "web-search", "all"],
+        choices=["pipeline", "react", "query-plan", "web-search", "react-web-search", "all"],
         default="pipeline",
         help="Evaluation path to run. Use 'all' for every path.",
     )
@@ -195,6 +197,12 @@ async def main() -> int:
                     logging.warning("Skipping web-search eval for model=%s: missing TAVILY_API_KEY", model)
                     summary = make_skipped_web_search_eval(model, "missing_tavily_api_key")
                 run_record, cases = web_search_summary_to_records(summary)
+            elif eval_path == "react-web-search":
+                summary = await run_react_web_search_eval(
+                    graph,
+                    model_name=model,
+                )
+                run_record, cases = react_web_search_summary_to_records(summary)
             else:
                 summary = await run_path_eval(
                     graph=graph,

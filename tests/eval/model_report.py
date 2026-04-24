@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from db.models import ModelEvalCase, ModelEvalRun
 from tests.eval.compare import CompareSummary
 from tests.eval.query_plan_runner import QueryPlanEvalSummary
+from tests.eval.react_web_search_runner import ReactWebSearchEvalSummary
 from tests.eval.web_search_runner import WebSearchEvalSummary
 
 
@@ -43,6 +44,9 @@ def compare_summary_to_records(summary: CompareSummary, path: str) -> tuple[dict
         "precision_at_5": agg.precision_at_5,
         "ndcg_at_5": agg.ndcg_at_5,
         "query_plan_accuracy": agg.query_plan_accuracy,
+        "tool_argument_accuracy": agg.tool_argument_accuracy,
+        "search_web_recall": agg.search_web_recall if path == "react" else None,
+        "search_web_grounding_rate": agg.search_web_grounding_rate if path == "react" else None,
         "fallback_rate": agg.fallback_rate,
         "avg_latency_ms": agg.avg_latency_ms,
         "p95_latency_ms": agg.p95_latency_ms,
@@ -52,6 +56,8 @@ def compare_summary_to_records(summary: CompareSummary, path: str) -> tuple[dict
         "tool_recall": agg.tool_recall if path == "react" else None,
         "tool_precision": agg.tool_precision if path == "react" else None,
         "unnecessary_ingest_rate": agg.unnecessary_ingest_rate if path == "react" else None,
+        "tool_unsupported_rate": agg.tool_unsupported_rate if path == "react" else None,
+        "infra_failure_rate": agg.infra_failure_rate if path == "react" else None,
         "summary_json": _jsonable(summary),
     }
 
@@ -74,16 +80,23 @@ def compare_summary_to_records(summary: CompareSummary, path: str) -> tuple[dict
                 "precision_at_5": metrics.precision_at_5,
                 "ndcg_at_5": metrics.ndcg_at_5,
                 "query_plan_accuracy": metrics.query_plan_accuracy,
+                "tool_argument_accuracy": metrics.tool_argument_accuracy if path == "react" else None,
+                "search_web_recall": metrics.search_web_recall if path == "react" else None,
+                "search_web_grounding_rate": metrics.search_web_grounding_rate if path == "react" else None,
                 "used_fallback": result.used_fallback,
                 "latency_ms": result.latency_ms,
                 "llm_calls": result.llm_calls,
                 "total_tokens": result.total_tokens,
                 "estimated_cost": result.estimated_cost,
+                "error_status": result.error_status,
                 "tool_recall": metrics.tool_recall if path == "react" else None,
                 "tool_precision": metrics.tool_precision if path == "react" else None,
                 "unnecessary_ingest": metrics.unnecessary_ingest if path == "react" else None,
+                "tool_unsupported": metrics.tool_unsupported if path == "react" else None,
+                "infra_failure": metrics.infra_failure if path == "react" else None,
                 "expected_plan": getattr(case, "expected_plan", None),
                 "actual_plan": result.query_plan,
+                "tool_arguments": result.tool_arguments if path == "react" else None,
                 "raw_json": _jsonable(case),
             }
         )
@@ -139,6 +152,39 @@ def web_search_summary_to_records(summary: WebSearchEvalSummary) -> tuple[dict, 
         "avg_total_tokens": summary.avg_total_tokens,
         "status": "skipped" if summary.skipped else "completed",
         "skip_reason": summary.skip_reason,
+        "summary_json": _jsonable(summary),
+    }
+    cases = [
+        {
+            "query": case.query,
+            "response": case.response,
+            "error_msg": case.error,
+            "grounding_rate": case.grounding_rate,
+            "latency_ms": case.latency_ms,
+            "llm_calls": case.llm_calls,
+            "total_tokens": case.total_tokens,
+            "raw_json": _jsonable(case),
+        }
+        for case in summary.cases
+    ]
+    return run, cases
+
+
+def react_web_search_summary_to_records(summary: ReactWebSearchEvalSummary) -> tuple[dict, list[dict]]:
+    run = {
+        "model_name": summary.model_name,
+        "eval_path": "react-web-search",
+        "probe_count": summary.n,
+        "has_db_eval": False,
+        "search_success_rate": summary.search_success_rate,
+        "avg_source_count": summary.avg_source_count,
+        "grounding_rate": summary.grounding_rate,
+        "avg_latency_ms": summary.avg_latency_ms,
+        "p95_latency_ms": summary.p95_latency_ms,
+        "avg_llm_calls": summary.avg_llm_calls,
+        "avg_total_tokens": summary.avg_total_tokens,
+        "tool_unsupported_rate": summary.tool_unsupported_rate,
+        "infra_failure_rate": summary.infra_failure_rate,
         "summary_json": _jsonable(summary),
     }
     cases = [
