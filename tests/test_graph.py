@@ -96,6 +96,7 @@ class TestClassifyIntent:
     @pytest.mark.parametrize("query,expected_intent,expected_csv,expected_cat", [
         ("이어폰 5만원 이하",    "sql", "Headphones.csv",         "Headphones"),
         ("헤드폰 추천해줘",      "llm", "Headphones.csv",         "Headphones"),
+        ("이어폰 후기 알려줘",   "sql", "Headphones.csv",         "Headphones"),
         ("스피커 목록",          "sql", "Speakers.csv",           "Speakers"),
         ("tv 50만원 이하",       "sql", "Televisions.csv",        "Televisions"),
         ("냉장고 어때",          "llm", "Refrigerators.csv",      "Refrigerators"),
@@ -108,6 +109,7 @@ class TestClassifyIntent:
         assert result["intent"] == expected_intent
         assert result["csv_filename"] == expected_csv
         assert result["category"] == expected_cat
+        assert result["needs_web_search"] == ("후기" in query)
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +527,7 @@ class TestReActPath:
 # ---------------------------------------------------------------------------
 
 class TestWebSearchPath:
-    """web_search 인텐트 — Tavily 호출 후 generate_response."""
+    """DB anchored web_search 경로."""
 
     def _make_tavily_deps(self, tavily_response: list[dict], llm_text: str = "웹 검색 응답") -> GraphDeps:
         """Tavily 를 AsyncMock 으로 교체한 deps."""
@@ -535,22 +537,16 @@ class TestWebSearchPath:
             tavily_api_key="test-key",
         )
 
-    @pytest.mark.parametrize("query", [
-        "Sony WH-1000XM5 리뷰",
-        "이어폰 후기 알려줘",
-        "노트북 사용자 평가",
-        "사람들의 의견이 궁금해",
-        "실사용 후기 보여줘",
-        "이어폰 사용기",
-    ])
-    async def test_web_search_intent_detected(self, query):
-        """web_search 키워드 포함 쿼리는 web_search 인텐트로 분류된다."""
+    @pytest.mark.parametrize("query", ["이어폰 후기 알려줘", "실사용 후기 보여줘", "이어폰 사용기"])
+    async def test_review_query_sets_web_search_flag(self, query):
+        """리뷰 질의는 direct web_search 대신 needs_web_search 로 표시된다."""
         node = make_classify_intent_node()
         result = await node({"query": query})
-        assert result["intent"] == "web_search", f"query={query!r} → intent={result['intent']!r}"
+        assert result["intent"] in {"sql", "llm"}, f"query={query!r} → intent={result['intent']!r}"
+        assert result["needs_web_search"] is True
 
-    async def test_web_search_path_returns_response(self):
-        """web_search 경로: Tavily 결과 → generate_response."""
+    async def test_review_query_runs_db_then_web_search(self):
+        """리뷰 질의는 DB 후보를 찾은 뒤 anchored web_search 를 수행한다."""
         tavily_results = [
             {"title": "Sony 리뷰", "url": "https://example.com", "content": "음질이 훌륭합니다."}
         ]
@@ -560,49 +556,59 @@ class TestWebSearchPath:
             mock_instance.search = AsyncMock(return_value={"results": tavily_results})
 
             deps = GraphDeps(
-                session_factory=_make_session_factory(),
+                session_factory=_make_session_factory(
+                    rows=[{"id": 1, "name": "Sony WH-1000XM5", "brand": "Sony", "price": 15625, "rating": 4.4}],
+                    check_row=True,
+                ),
                 llm=_make_llm("Sony 리뷰 요약 응답"),
                 tavily_api_key="test-key",
             )
-            result = await build_graph(deps).ainvoke({"query": "Sony WH-1000XM5 리뷰"})
+            result = await build_graph(deps).ainvoke({"query": "이어폰 후기 알려줘"})
 
-        assert result["intent"] == "web_search"
+        assert result["intent"] == "sql"
+        assert result["sql_rows"][0]["name"] == "Sony WH-1000XM5"
         assert result["web_results"] == tavily_results
         assert result["response"] == "Sony 리뷰 요약 응답"
-        assert result.get("sql_rows") is None   # DB 조회 없음
+        assert "Sony WH-1000XM5" in result["web_search_query"]
 
     async def test_web_search_no_api_key_graceful(self):
-        """TAVILY_API_KEY 없으면 web_results=[] 로 graceful degradation."""
+        """리뷰 질의에서도 키가 없으면 DB 정보만으로 응답한다."""
         deps = GraphDeps(
-            session_factory=_make_session_factory(),
+            session_factory=_make_session_factory(
+                rows=[{"id": 1, "name": "Sony WH-1000XM5", "brand": "Sony", "price": 15625, "rating": 4.4}],
+                check_row=True,
+            ),
             llm=_make_llm("키 없음 응답"),
             tavily_api_key=None,    # 키 없음
         )
         result = await build_graph(deps).ainvoke({"query": "이어폰 후기"})
 
-        assert result["intent"] == "web_search"
+        assert result["intent"] == "sql"
         assert result["web_results"] == []
         assert result["response"] == "키 없음 응답"
 
     async def test_web_search_tavily_error_graceful(self):
-        """Tavily 호출 실패 시 web_results=[], error 필드 설정."""
+        """Tavily 호출 실패 시 DB anchor 는 유지되고 web_results 는 비워진다."""
         with patch("tavily.AsyncTavilyClient") as MockClient:
             mock_instance = AsyncMock()
             MockClient.return_value = mock_instance
             mock_instance.search = AsyncMock(side_effect=RuntimeError("Tavily 오류"))
 
             deps = GraphDeps(
-                session_factory=_make_session_factory(),
+                session_factory=_make_session_factory(
+                    rows=[{"id": 1, "name": "Sony WH-1000XM5", "brand": "Sony", "price": 15625, "rating": 4.4}],
+                    check_row=True,
+                ),
                 llm=_make_llm("오류 후 응답"),
                 tavily_api_key="test-key",
             )
-            result = await build_graph(deps).ainvoke({"query": "Sony WH-1000XM5 리뷰"})
+            result = await build_graph(deps).ainvoke({"query": "이어폰 후기"})
 
         assert result["web_results"] == []
         assert "Tavily 오류" in result.get("error", "")
 
-    async def test_generate_response_uses_web_results_over_sql_rows(self):
-        """web_results 가 있으면 sql_rows 보다 우선해 컨텍스트로 사용한다."""
+    async def test_generate_response_combines_web_results_with_sql_rows(self):
+        """web_results 와 sql_rows 가 모두 있으면 두 컨텍스트를 함께 사용한다."""
         from agent.nodes import make_generate_response_node
 
         captured_prompt: list[str] = []
@@ -624,10 +630,35 @@ class TestWebSearchPath:
         })
 
         full_prompt = "\n".join(captured_prompt)
+        assert "상품 데이터:" in full_prompt
+        assert "product" in full_prompt
         assert "웹 검색 결과" in full_prompt
         assert "웹 내용" in full_prompt
-        # sql_rows 를 컨텍스트로 사용했다면 "상품 데이터:" 섹션이 나타남
-        assert "상품 데이터:" not in full_prompt
+
+    async def test_db_miss_review_query_does_not_fallback_to_raw_web_search(self):
+        """DB anchor 가 없으면 후기 웹검색 단독 fallback 을 하지 않는다."""
+        rows_result = MagicMock()
+        rows_result.fetchall.return_value = []
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=rows_result)
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        factory = MagicMock()
+        factory.return_value = ctx
+
+        deps = GraphDeps(
+            session_factory=factory,
+            llm=_make_llm("이 응답은 사용되지 않아야 함"),
+            tavily_api_key="test-key",
+        )
+
+        with patch("tavily.AsyncTavilyClient") as MockClient:
+            result = await build_graph(deps).ainvoke({"query": "Sony WH-1000XM5 리뷰"})
+
+        MockClient.assert_not_called()
+        assert result["db_miss"] is True
+        assert "DB" in result["response"]
 
     async def test_react_search_web_tool_no_key(self):
         """search_web 도구 — API 키 없으면 빈 results 반환."""
@@ -654,3 +685,56 @@ class TestWebSearchPath:
 
         assert len(result["results"]) == 1
         assert result["results"][0]["title"] == "리뷰"
+
+    async def test_react_resolve_product_tool(self):
+        import json
+        from agent.react_nodes import _exec_resolve_product
+
+        rows_result = MagicMock()
+        rows_result.fetchall.return_value = [
+            MagicMock(_mapping={
+                "id": 1,
+                "name": "Sony WH-1000XM5",
+                "brand": "Sony",
+                "category": "Headphones",
+                "price": 15625,
+                "rating": 4.4,
+                "review_count": 1200,
+                "source_site": "kaggle/amazon-products/Headphones",
+                "source_url": "https://example.com",
+            })
+        ]
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=rows_result)
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        factory = MagicMock()
+        factory.return_value = ctx
+
+        result = json.loads(await _exec_resolve_product(factory, "Sony WH-1000XM5 리뷰"))
+        assert result["count"] == 1
+        assert "Sony WH-1000XM5" in result["search_query"]
+
+    async def test_react_blocks_unanchored_search_web(self):
+        """ReAct 도 DB anchor 없이 search_web 단독 호출을 허용하지 않는다."""
+        llm = _make_react_llm(
+            tool_calls_sequence=[
+                [{"name": "search_web", "id": "c1", "args": {"query": "Sony WH-1000XM5 리뷰"}}],
+            ],
+            final_text="최종 답변",
+        )
+        deps = GraphDeps(
+            session_factory=_make_react_session_factory(),
+            llm=llm,
+            tavily_api_key="test-key",
+        )
+
+        with patch("tavily.AsyncTavilyClient") as MockClient:
+            result = await build_graph(deps).ainvoke(
+                {"query": "Sony WH-1000XM5 리뷰", "use_react": True}
+            )
+
+        MockClient.assert_not_called()
+        tool_message = result["react_messages"][3]
+        assert "db_anchor_required_for_web_search" in tool_message.content

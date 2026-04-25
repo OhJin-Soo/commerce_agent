@@ -26,6 +26,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent.nodes import _CATEGORY_MAP, _source_site_from
+from agent.resolve_product import (
+    build_db_anchored_web_query,
+    needs_web_search as query_needs_web_search,
+    resolve_product_candidates,
+)
 from agent.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -37,9 +42,11 @@ SYSTEM_PROMPT = (
     "사용 가능한 도구를 단계적으로 활용해 사용자 질문에 답하세요.\n\n"
     "권장 워크플로우:\n"
     "1. search_category 로 관련 카테고리 CSV 파일명을 찾는다\n"
-    "2. check_db_loaded 로 DB에 데이터가 있는지 확인한다\n"
-    "3. query_products 로 조건에 맞는 상품을 조회한다\n"
-    "4. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
+    "2. 특정 상품명 리뷰/후기 질의라면 resolve_product 로 DB anchor 를 먼저 찾는다\n"
+    "3. check_db_loaded 로 DB에 데이터가 있는지 확인한다\n"
+    "4. query_products 로 조건에 맞는 상품을 조회한다\n"
+    "5. 리뷰/후기가 필요하면 DB anchor 를 바탕으로 search_web 를 사용한다\n"
+    "6. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
     "중요: 요청 처리 중에는 데이터를 적재하지 않는다. DB에 데이터가 없으면 "
     "적재가 필요하다고 설명하고, 별도 preload 스크립트 실행을 안내한다.\n\n"
     "가격은 항상 원화(₩)로 표시하세요."
@@ -56,6 +63,10 @@ class SearchCategoryInput(BaseModel):
 
 class CheckDbLoadedInput(BaseModel):
     csv_filename: str = Field(..., description="확인할 CSV 파일명 (예: 'Headphones.csv')")
+
+
+class ResolveProductInput(BaseModel):
+    query: str = Field(..., description="상품명 또는 상품명 포함 질의 (예: 'Sony WH-1000XM5 리뷰')")
 
 
 class QueryProductsInput(BaseModel):
@@ -85,6 +96,12 @@ TOOL_SCHEMAS: list[StructuredTool] = [
         name="check_db_loaded",
         description="DB에 해당 CSV 데이터가 로드되어 있는지 확인한다",
         args_schema=CheckDbLoadedInput,
+    ),
+    StructuredTool.from_function(
+        func=_noop,
+        name="resolve_product",
+        description="리뷰/후기 질의에서 DB 안의 상품 후보를 찾고, 웹 검색 anchor 를 만든다",
+        args_schema=ResolveProductInput,
     ),
     StructuredTool.from_function(
         func=_noop,
@@ -142,6 +159,26 @@ async def _exec_check_db_loaded(
         return json.dumps({"loaded": row is not None, "source_site": source_site})
     except Exception as exc:
         return json.dumps({"loaded": False, "error": str(exc)})
+
+
+async def _exec_resolve_product(
+    session_factory: async_sessionmaker,
+    query: str,
+) -> str:
+    try:
+        rows = await resolve_product_candidates(session_factory, query, limit=5)
+    except Exception as exc:
+        return json.dumps({"products": [], "error": str(exc)}, ensure_ascii=False)
+
+    return json.dumps(
+        {
+            "products": rows,
+            "count": len(rows),
+            "search_query": build_db_anchored_web_query(query, rows),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 async def _exec_query_products(
@@ -207,6 +244,22 @@ async def _exec_search_web(tavily_api_key: str | None, query: str) -> str:
         return json.dumps({"results": results}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"results": [], "error": str(exc)}, ensure_ascii=False)
+
+
+def _has_db_anchor(messages: list) -> bool:
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "name", None) not in {"resolve_product", "query_products"}:
+            continue
+        try:
+            payload = json.loads(message.content)
+        except Exception:
+            continue
+        products = payload.get("products") or []
+        if products:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +335,8 @@ def make_react_act_node(
             return _exec_search_category(**args)
         if name == "check_db_loaded":
             return await _exec_check_db_loaded(session_factory, **args)
+        if name == "resolve_product":
+            return await _exec_resolve_product(session_factory, **args)
         if name == "query_products":
             return await _exec_query_products(
                 session_factory, exchange_rate, **args
@@ -307,7 +362,23 @@ def make_react_act_node(
             tool_call_id = tc.get("id", name)
             logger.info("react_act [iter=%d]: %s(%s)", iterations, name, args)
             try:
-                observation = await _dispatch(name, args)
+                if (
+                    name == "search_web"
+                    and query_needs_web_search(state["query"])
+                    and not _has_db_anchor(messages)
+                ):
+                    observation = json.dumps(
+                        {
+                            "results": [],
+                            "error": (
+                                "db_anchor_required_for_web_search: "
+                                "DB 후보 상품 없이 외부 후기 검색을 수행하지 않습니다"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    observation = await _dispatch(name, args)
             except Exception as exc:
                 observation = json.dumps({"error": str(exc)})
                 logger.error("react_act 도구 실행 실패 [%s]: %s", name, exc)

@@ -46,6 +46,7 @@ from agent.nodes import (
     make_classify_intent_node,
     make_generate_query_plan_node,
     make_generate_response_node,
+    make_resolve_product_node,
     make_run_sql_node,
     make_web_search_node,
 )
@@ -77,23 +78,35 @@ class GraphDeps:
 # ---------------------------------------------------------------------------
 
 def _route_after_classify(state: AgentState) -> str:
-    """인텐트와 csv_filename 에 따라 다음 노드를 결정한다.
-
-    - web_search 인텐트 → web_search 노드 (Tavily 호출)
-    - 그 외 → generate_query_plan 노드에서 structured output 시도
-    """
-    if state.get("intent") == "web_search":
-        return "web_search"
+    """파이프라인 경로는 항상 QueryPlan/DB anchored 흐름으로 진입한다."""
     return "generate_query_plan"
 
 
 def _route_after_query_plan(state: AgentState) -> str:
-    """QueryPlan 이후 카테고리가 있으면 DB 경로, 없으면 LLM 직행."""
-    return "check_loaded" if state.get("csv_filename") else "generate_response"
+    """QueryPlan 이후 DB anchored 경로 여부를 결정한다."""
+    if state.get("csv_filename"):
+        return "check_loaded"
+    if state.get("needs_web_search"):
+        return "resolve_product"
+    return "generate_response"
+
+
+def _route_after_resolve_product(state: AgentState) -> str:
+    if state.get("sql_rows") and state.get("needs_web_search"):
+        return "web_search"
+    if state.get("csv_filename"):
+        return "check_loaded"
+    return "generate_response"
 
 
 def _route_check_loaded(state: AgentState) -> str:
     return "run_sql"
+
+
+def _route_after_run_sql(state: AgentState) -> str:
+    if state.get("needs_web_search") and state.get("sql_rows"):
+        return "web_search"
+    return "generate_response"
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +141,7 @@ def build_graph(deps: GraphDeps):
     # ── 파이프라인 노드 ────────────────────────────────────────────────────
     workflow.add_node("classify_intent",   make_classify_intent_node())
     workflow.add_node("generate_query_plan", make_generate_query_plan_node(deps.llm))
+    workflow.add_node("resolve_product",   make_resolve_product_node(deps.session_factory))
     workflow.add_node("web_search",        make_web_search_node(deps.tavily_api_key))
     workflow.add_node("check_loaded",      make_check_loaded_node(deps.session_factory))
     workflow.add_node("run_sql",           make_run_sql_node(deps.session_factory, exchange_rate=deps.exchange_rate))
@@ -154,23 +168,37 @@ def build_graph(deps: GraphDeps):
     workflow.add_conditional_edges(
         "classify_intent",
         _route_after_classify,
-        {
-            "web_search":        "web_search",
-            "generate_query_plan": "generate_query_plan",
-        },
+        {"generate_query_plan": "generate_query_plan"},
     )
-    workflow.add_edge("web_search", "generate_response")
     workflow.add_conditional_edges(
         "generate_query_plan",
         _route_after_query_plan,
-        {"check_loaded": "check_loaded", "generate_response": "generate_response"},
+        {
+            "check_loaded": "check_loaded",
+            "resolve_product": "resolve_product",
+            "generate_response": "generate_response",
+        },
+    )
+    workflow.add_conditional_edges(
+        "resolve_product",
+        _route_after_resolve_product,
+        {
+            "web_search": "web_search",
+            "check_loaded": "check_loaded",
+            "generate_response": "generate_response",
+        },
     )
     workflow.add_conditional_edges(
         "check_loaded",
         _route_check_loaded,
         {"run_sql": "run_sql"},
     )
-    workflow.add_edge("run_sql",           "generate_response")
+    workflow.add_conditional_edges(
+        "run_sql",
+        _route_after_run_sql,
+        {"web_search": "web_search", "generate_response": "generate_response"},
+    )
+    workflow.add_edge("web_search", "generate_response")
     workflow.add_edge("generate_response", END)
 
     # ── ReAct 엣지 ────────────────────────────────────────────────────────
