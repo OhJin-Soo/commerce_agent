@@ -22,10 +22,10 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent.nodes import _CATEGORY_MAP, _source_site_from
+from agent.query_plan import QueryPlan, SortMode, build_select_from_query_plan
 from agent.resolve_product import (
     build_db_anchored_web_query,
     needs_web_search as query_needs_web_search,
@@ -73,6 +73,11 @@ class QueryProductsInput(BaseModel):
     csv_filename: str = Field(..., description="조회할 CSV 파일명 (예: 'Headphones.csv')")
     max_price_krw: int | None = Field(None, description="최대 가격 KRW (이하/미만 조건)")
     min_price_krw: int | None = Field(None, description="최소 가격 KRW (이상/초과 조건)")
+    min_rating: float | None = Field(None, description="최소 평점")
+    min_review_count: int | None = Field(None, description="최소 리뷰 수")
+    brand_include: list[str] = Field(default_factory=list, description="포함할 브랜드 목록")
+    brand_exclude: list[str] = Field(default_factory=list, description="제외할 브랜드 목록")
+    sort: SortMode = Field("rating_desc", description="정렬 기준")
     limit: int = Field(10, description="반환할 최대 상품 수")
 
 
@@ -187,36 +192,47 @@ async def _exec_query_products(
     csv_filename: str,
     max_price_krw: int | None = None,
     min_price_krw: int | None = None,
+    min_rating: float | None = None,
+    min_review_count: int | None = None,
+    brand_include: list[str] | None = None,
+    brand_exclude: list[str] | None = None,
+    sort: SortMode = "rating_desc",
     limit: int = 10,
 ) -> str:
     source_site = _source_site_from(csv_filename)
-    conditions: list[str] = []
-    if source_site:
-        conditions.append(f"source_site = '{source_site}'")
-    if max_price_krw is not None:
-        inr = int(max_price_krw / exchange_rate) if exchange_rate else max_price_krw
-        conditions.append(f"price <= {inr}")
-    if min_price_krw is not None:
-        inr = int(min_price_krw / exchange_rate) if exchange_rate else min_price_krw
-        conditions.append(f"price >= {inr}")
-
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    sql = (
-        f"SELECT name, brand, price, rating, review_count "
-        f"FROM normalized_products {where} "
-        f"ORDER BY rating DESC NULLS LAST LIMIT {limit}"
-    )
     try:
+        plan = QueryPlan(
+            csv_filename=csv_filename,
+            max_price_krw=max_price_krw,
+            min_price_krw=min_price_krw,
+            min_rating=min_rating,
+            min_review_count=min_review_count,
+            brand_include=brand_include or [],
+            brand_exclude=brand_exclude or [],
+            sort=sort,
+            limit=limit,
+        )
+        stmt = build_select_from_query_plan(
+            plan,
+            source_site=source_site,
+            exchange_rate=exchange_rate,
+        )
         async with session_factory() as session:
             rows = [
                 dict(r._mapping)
-                for r in (await session.execute(text(sql))).fetchall()
+                for r in (await session.execute(stmt)).fetchall()
             ]
         for r in rows:
             if r.get("price") is not None:
                 r["price_krw"] = int(float(r["price"]) * exchange_rate)
         return json.dumps(
-            {"products": rows, "count": len(rows)}, ensure_ascii=False, default=str
+            {
+                "products": rows,
+                "count": len(rows),
+                "applied_filters": plan.model_dump(exclude_none=True),
+            },
+            ensure_ascii=False,
+            default=str,
         )
     except Exception as exc:
         return json.dumps({"products": [], "error": str(exc)})
