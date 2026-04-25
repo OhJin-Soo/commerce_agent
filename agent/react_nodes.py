@@ -185,9 +185,9 @@ async def _exec_query_products(
     session_factory: async_sessionmaker,
     exchange_rate: float,
     csv_filename: str,
-    max_price_krw: int | None,
-    min_price_krw: int | None,
-    limit: int,
+    max_price_krw: int | None = None,
+    min_price_krw: int | None = None,
+    limit: int = 10,
 ) -> str:
     source_site = _source_site_from(csv_filename)
     conditions: list[str] = []
