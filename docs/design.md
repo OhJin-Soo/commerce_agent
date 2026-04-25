@@ -746,8 +746,8 @@ eval_models.py            # 모델 비교 CLI + DB 저장 + JSON/CSV export
 uv run python eval.py --model rule-based-v1
 
 # 모델 비교 평가 + model_eval_runs/model_eval_cases 저장 + 리포트 export
-uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b,gemma4:26b --path all
-uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b,gemma4:26b --paths pipeline,query-plan
+uv run python eval_models.py --models llama3.1:8b,gemma4:26b --path all
+uv run python eval_models.py --models llama3.1:8b,gemma4:26b --paths pipeline,query-plan
 uv run python eval_models.py --models llama3.1:8b --path react --no-db-eval
 uv run python eval_models.py --models llama3.1:8b --path query-plan
 
