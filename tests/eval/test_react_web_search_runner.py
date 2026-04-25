@@ -14,7 +14,7 @@ def _tool_msg(name: str, content: str) -> ToolMessage:
 
 
 def _make_graph(state: dict) -> MagicMock:
-    async def ainvoke(_state: dict):
+    async def ainvoke(_state: dict, **_kwargs):
         return state
 
     graph = MagicMock()

@@ -13,8 +13,10 @@ from agent import GraphDeps, build_graph
 from api.routes import router
 from db.currency import fetch_inr_to_krw
 from db.session import AsyncSessionLocal
+from observability.langsmith import configure_langsmith
 
 load_dotenv()
+configure_langsmith()
 
 logger = logging.getLogger(__name__)
 

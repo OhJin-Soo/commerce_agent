@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.deps import get_exchange_rate
 from api.models import QueryRequest, QueryResponse
+from observability.langsmith import build_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,18 @@ async def query_endpoint(
         body.query, body.use_react, body.model,
     )
     try:
+        run_config = build_run_config(
+            "api.query",
+            tags=["api", "query", "react" if body.use_react else "pipeline", body.model],
+            metadata={
+                "model": body.model,
+                "use_react": body.use_react,
+                "query_length": len(body.query),
+            },
+        )
         result: dict = await graph.ainvoke(
-            {"query": body.query, "use_react": body.use_react}
+            {"query": body.query, "use_react": body.use_react},
+            config=run_config,
         )
     except Exception as exc:
         logger.exception("graph.ainvoke failed")

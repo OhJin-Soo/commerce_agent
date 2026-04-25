@@ -5,6 +5,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from observability.langsmith import build_run_config
 from tests.eval.compare import (
     _classify_error_status,
     _extract_search_web_queries,
@@ -72,7 +73,12 @@ class ReactWebSearchEvalSummary:
 async def _run_case(graph, case: ReactWebSearchGoldenCase) -> ReactWebSearchCaseResult:
     t0 = time.perf_counter()
     try:
-        state: dict = await graph.ainvoke({"query": case.query, "use_react": True})
+        run_config = build_run_config(
+            "eval.react_web_search",
+            tags=["eval", "react", "web-search"],
+            metadata={"query": case.query, "use_react": True},
+        )
+        state: dict = await graph.ainvoke({"query": case.query, "use_react": True}, config=run_config)
     except Exception as exc:
         latency_ms = (time.perf_counter() - t0) * 1000
         return ReactWebSearchCaseResult(

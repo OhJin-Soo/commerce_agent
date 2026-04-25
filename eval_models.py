@@ -24,6 +24,7 @@ from agent import GraphDeps, build_graph
 from agent.nodes import make_generate_query_plan_node, make_generate_response_node, make_web_search_node
 from db.currency import fetch_inr_to_krw
 from db.session import AsyncSessionLocal
+from observability.langsmith import configure_langsmith
 from tests.eval.compare import run_path_eval
 from tests.eval.model_report import (
     compare_summary_to_records,
@@ -103,6 +104,7 @@ async def _build_graph(model: str):
 
 async def main() -> int:
     load_dotenv()
+    configure_langsmith()
     parser = argparse.ArgumentParser(description="Evaluate commerce-agent models.")
     parser.add_argument(
         "--models",

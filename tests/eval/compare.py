@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from observability.langsmith import build_run_config
 from tests.eval.metrics import (
     answer_faithfulness,
     category_hit,
@@ -444,7 +445,12 @@ async def _run_path(
     """그래프를 한 경로로 실행하고 PathResult 를 반환한다."""
     t0 = time.perf_counter()
     try:
-        state: dict = await graph.ainvoke({"query": query, "use_react": use_react})
+        run_config = build_run_config(
+            "eval.path",
+            tags=["eval", "react" if use_react else "pipeline"],
+            metadata={"query": query, "use_react": use_react},
+        )
+        state: dict = await graph.ainvoke({"query": query, "use_react": use_react}, config=run_config)
     except Exception as exc:
         latency_ms = (time.perf_counter() - t0) * 1000
         logger.error("_run_path error [react=%s, query=%r]: %s", use_react, query, exc)
