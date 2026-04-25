@@ -223,6 +223,31 @@ async def persist_model_eval(
         return int(run.id)
 
 
+async def persist_model_evals(
+    session_factory: async_sessionmaker,
+    records: list[tuple[dict, list[dict]]],
+) -> list[int]:
+    """여러 평가 결과를 하나의 트랜잭션으로 저장한다."""
+    runs = []
+    for run_record, case_records in records:
+        run = ModelEvalRun(
+            **{k: v for k, v in run_record.items() if hasattr(ModelEvalRun, k)}
+        )
+        run.cases = [
+            ModelEvalCase(**{k: v for k, v in case.items() if hasattr(ModelEvalCase, k)})
+            for case in case_records
+        ]
+        runs.append(run)
+
+    async with session_factory() as session:
+        for run in runs:
+            session.add(run)
+        await session.commit()
+        for run in runs:
+            await session.refresh(run)
+        return [int(run.id) for run in runs]
+
+
 def export_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(

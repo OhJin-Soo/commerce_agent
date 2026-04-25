@@ -29,7 +29,7 @@ from tests.eval.model_report import (
     compare_summary_to_records,
     export_csv,
     export_json,
-    persist_model_eval,
+    persist_model_evals,
     query_plan_summary_to_records,
     react_web_search_summary_to_records,
     web_search_summary_to_records,
@@ -174,67 +174,94 @@ async def main() -> int:
         logging.info("Starting batch eval batch_id=%s", batch_id)
     run_records: list[dict] = []
     case_records: list[dict] = []
+    pending_persist: list[tuple[dict, list[dict]]] = []
 
-    for model in models:
-        logging.info("Building graph for model=%s", model)
-        runtime = await _build_graph(model)
-        graph = runtime["graph"]
+    try:
+        for model in models:
+            logging.info("Building graph for model=%s", model)
+            runtime = await _build_graph(model)
+            graph = runtime["graph"]
 
-        for eval_path in paths:
-            logging.info("Evaluating model=%s path=%s", model, eval_path)
+            for eval_path in paths:
+                logging.info("Evaluating model=%s path=%s", model, eval_path)
 
-            if eval_path == "query-plan":
-                summary = await run_query_plan_eval(runtime["query_plan_node"], model_name=model)
-                run_record, cases = query_plan_summary_to_records(summary)
-            elif eval_path == "web-search":
-                if runtime["tavily_enabled"]:
-                    summary = await run_web_search_eval(
-                        runtime["web_search_node"],
-                        runtime["response_node"],
+                if eval_path == "query-plan":
+                    summary = await run_query_plan_eval(runtime["query_plan_node"], model_name=model)
+                    run_record, cases = query_plan_summary_to_records(summary)
+                elif eval_path == "web-search":
+                    if runtime["tavily_enabled"]:
+                        summary = await run_web_search_eval(
+                            runtime["web_search_node"],
+                            runtime["response_node"],
+                            model_name=model,
+                        )
+                    else:
+                        logging.warning("Skipping web-search eval for model=%s: missing TAVILY_API_KEY", model)
+                        summary = make_skipped_web_search_eval(model, "missing_tavily_api_key")
+                    run_record, cases = web_search_summary_to_records(summary)
+                elif eval_path == "react-web-search":
+                    summary = await run_react_web_search_eval(
+                        graph,
                         model_name=model,
                     )
+                    run_record, cases = react_web_search_summary_to_records(summary)
                 else:
-                    logging.warning("Skipping web-search eval for model=%s: missing TAVILY_API_KEY", model)
-                    summary = make_skipped_web_search_eval(model, "missing_tavily_api_key")
-                run_record, cases = web_search_summary_to_records(summary)
-            elif eval_path == "react-web-search":
-                summary = await run_react_web_search_eval(
-                    graph,
-                    model_name=model,
+                    summary = await run_path_eval(
+                        graph=graph,
+                        cases=REACT_GOLDEN_SET,
+                        use_react=eval_path == "react",
+                        session_factory=None if args.no_db_eval else AsyncSessionLocal,
+                        model_name=model,
+                        input_cost_per_1k=args.input_cost_per_1k,
+                        output_cost_per_1k=args.output_cost_per_1k,
+                    )
+                    run_record, cases = compare_summary_to_records(summary, eval_path)
+
+                if batch_id:
+                    run_record["batch_id"] = batch_id
+
+                if not args.no_save and run_record.get("status") != "skipped":
+                    pending_persist.append((dict(run_record), list(cases)))
+
+                run_records.append(run_record)
+                case_records.extend({**case, "model_name": model, "eval_path": eval_path} for case in cases)
+                payload["runs"].append(
+                    {
+                        "model_name": model,
+                        "eval_path": eval_path,
+                        "run": run_record,
+                        "cases": cases,
+                    }
                 )
-                run_record, cases = react_web_search_summary_to_records(summary)
-            else:
-                summary = await run_path_eval(
-                    graph=graph,
-                    cases=REACT_GOLDEN_SET,
-                    use_react=eval_path == "react",
-                    session_factory=None if args.no_db_eval else AsyncSessionLocal,
-                    model_name=model,
-                    input_cost_per_1k=args.input_cost_per_1k,
-                    output_cost_per_1k=args.output_cost_per_1k,
-                )
-                run_record, cases = compare_summary_to_records(summary, eval_path)
+                print(summary)
+                print()
+    except KeyboardInterrupt:
+        logging.warning("Evaluation interrupted. No DB rows or report files were written.")
+        return 130
+    except Exception:
+        logging.exception("Evaluation failed. No DB rows or report files were written.")
+        return 1
 
-            if batch_id:
-                run_record["batch_id"] = batch_id
-
-            if not args.no_save and not run_record.get("status") == "skipped":
-                run_id = await persist_model_eval(AsyncSessionLocal, run_record, cases)
-                run_record = {**run_record, "id": run_id}
-                logging.info("Persisted model eval run id=%s model=%s path=%s", run_id, model, eval_path)
-
-            run_records.append(run_record)
-            case_records.extend({**case, "model_name": model, "eval_path": eval_path} for case in cases)
-            payload["runs"].append(
-                {
-                    "model_name": model,
-                    "eval_path": eval_path,
-                    "run": run_record,
-                    "cases": cases,
-                }
+    if not args.no_save and pending_persist:
+        run_ids = await persist_model_evals(AsyncSessionLocal, pending_persist)
+        run_id_iter = iter(run_ids)
+        for entry in payload["runs"]:
+            run = entry["run"]
+            if run.get("status") == "skipped":
+                continue
+            run_id = next(run_id_iter)
+            run["id"] = run_id
+            logging.info(
+                "Persisted model eval run id=%s model=%s path=%s",
+                run_id,
+                entry["model_name"],
+                entry["eval_path"],
             )
-            print(summary)
-            print()
+        run_record_iter = iter(run_ids)
+        for run_record in run_records:
+            if run_record.get("status") == "skipped":
+                continue
+            run_record["id"] = next(run_record_iter)
 
     export_json(json_path, payload)
     export_csv(csv_path, run_records, case_records)
