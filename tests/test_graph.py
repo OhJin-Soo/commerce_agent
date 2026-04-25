@@ -716,6 +716,76 @@ class TestWebSearchPath:
         assert result["count"] == 1
         assert "Sony WH-1000XM5" in result["search_query"]
 
+    async def test_react_query_products_accepts_price_range_noise(self):
+        import json
+        from agent.react_nodes import _exec_query_products
+
+        sql_result = MagicMock()
+        sql_result.fetchall.return_value = [
+            MagicMock(_mapping={
+                "id": 1,
+                "name": "Sony WH-1000XM5",
+                "brand": "Sony",
+                "category": "Headphones",
+                "price": 15625,
+                "rating": 4.4,
+                "review_count": 1200,
+                "source_url": "https://example.com",
+            })
+        ]
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=sql_result)
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        factory = MagicMock()
+        factory.return_value = ctx
+
+        result = json.loads(await _exec_query_products(
+            factory,
+            16.0,
+            csv_filename="Headphones.csv",
+            price_range={"max": 50000},
+        ))
+        assert result["count"] == 1
+        assert result["applied_filters"]["max_price_krw"] == 50000
+
+    async def test_react_query_products_accepts_price_min_max_noise(self):
+        import json
+        from agent.react_nodes import _exec_query_products
+
+        sql_result = MagicMock()
+        sql_result.fetchall.return_value = [
+            MagicMock(_mapping={
+                "id": 1,
+                "name": "Sony WH-1000XM5",
+                "brand": "Sony",
+                "category": "Headphones",
+                "price": 15625,
+                "rating": 4.4,
+                "review_count": 1200,
+                "source_url": "https://example.com",
+            })
+        ]
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=sql_result)
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=session)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        factory = MagicMock()
+        factory.return_value = ctx
+
+        result = json.loads(await _exec_query_products(
+            factory,
+            16.0,
+            csv_filename="Headphones.csv",
+            price_min="10000",
+            price_max="50000",
+        ))
+        assert result["count"] == 1
+        assert result["applied_filters"]["min_price_krw"] == 10000
+        assert result["applied_filters"]["max_price_krw"] == 50000
+
     async def test_react_blocks_unanchored_search_web(self):
         """ReAct 도 DB anchor 없이 search_web 단독 호출을 허용하지 않는다."""
         llm = _make_react_llm(

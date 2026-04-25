@@ -22,6 +22,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent.nodes import _CATEGORY_MAP, _source_site_from
@@ -198,9 +199,48 @@ async def _exec_query_products(
     brand_exclude: list[str] | None = None,
     sort: SortMode = "rating_desc",
     limit: int = 10,
+    price_range: dict | list | str | None = None,
+    price_min: int | float | str | None = None,
+    price_max: int | float | str | None = None,
+    min_price: int | float | str | None = None,
+    max_price: int | float | str | None = None,
+    **_: Any,
 ) -> str:
     source_site = _source_site_from(csv_filename)
     try:
+        def _coerce_price(value):
+            if value is None or value == "":
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        if price_range is not None and (max_price_krw is None and min_price_krw is None):
+            if isinstance(price_range, dict):
+                max_price_krw = _coerce_price(
+                    price_range.get("max_price_krw") or price_range.get("max")
+                ) or max_price_krw
+                min_price_krw = _coerce_price(
+                    price_range.get("min_price_krw") or price_range.get("min")
+                ) or min_price_krw
+            elif isinstance(price_range, list) and len(price_range) >= 2:
+                min_price_krw = _coerce_price(price_range[0]) if min_price_krw is None else min_price_krw
+                max_price_krw = _coerce_price(price_range[1]) if max_price_krw is None else max_price_krw
+
+        if min_price_krw is None:
+            min_price_krw = (
+                _coerce_price(price_min)
+                or _coerce_price(min_price)
+                or min_price_krw
+            )
+        if max_price_krw is None:
+            max_price_krw = (
+                _coerce_price(price_max)
+                or _coerce_price(max_price)
+                or max_price_krw
+            )
+
         plan = QueryPlan(
             csv_filename=csv_filename,
             max_price_krw=max_price_krw,
