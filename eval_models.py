@@ -1,9 +1,9 @@
 """모델 평가 CLI.
 
 Examples:
-    uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b --path pipeline
-    uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b --path all
-    uv run python eval_models.py --models llama3.1:8b --paths pipeline,query-plan
+    uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b,gemma4:26b --path pipeline
+    uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b,gemma4:26b --path all
+    uv run python eval_models.py --models llama3.1:8b,deepseek-r1:8b,gemma4:26b --paths pipeline,query-plan
     uv run python eval_models.py --models llama3.1:8b --path react --no-db-eval
     uv run python eval_models.py --models llama3.1:8b --path query-plan --no-save
 """
@@ -106,7 +106,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate commerce-agent models.")
     parser.add_argument(
         "--models",
-        default=os.getenv("OLLAMA_MODELS", os.getenv("OLLAMA_MODEL", "llama3.1:8b")),
+        default=os.getenv("OLLAMA_MODELS", os.getenv("OLLAMA_MODEL", "llama3.1:8b,deepseek-r1:8b,gemma4:26b")),
         help="Comma-separated Ollama model names.",
     )
     parser.add_argument(

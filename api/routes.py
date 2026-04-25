@@ -44,7 +44,7 @@ def _resolve_graph(request: Request, model: str):
         "- LLM이 Thought→Act→Observe 루프로 도구를 직접 선택·실행\n"
         "- 응답의 `react_steps` 필드에서 도구 호출 횟수 확인 가능\n\n"
         "**모델 선택** (`model` 필드)\n"
-        "- `llama3.1:8b` (기본) 또는 `deepseek-r1:8b` 등 서버에 로드된 모델 지정"
+        "- `llama3.1:8b` (기본), `deepseek-r1:8b`, `gemma4:26b` 등 서버에 로드된 모델 지정"
     ),
 )
 async def query_endpoint(

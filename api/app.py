@@ -24,12 +24,16 @@ async def lifespan(app: FastAPI):
     """앱 시작 시 LangGraph 를 모델별로 한 번씩 빌드해 app.state 에 보관한다.
 
     환경 변수:
-        OLLAMA_MODELS   쉼표 구분 모델 목록 (기본: "llama3.1:8b")
-                        예) "llama3.1:8b,deepseek-r1:8b"
+        OLLAMA_MODELS   쉼표 구분 모델 목록
+                        기본: "llama3.1:8b,deepseek-r1:8b,gemma4:26b"
+                        예) "llama3.1:8b,deepseek-r1:8b,gemma4:26b"
         KAGGLE_DATASET_HANDLE   Kaggle 데이터셋 핸들
         KAGGLE_NROWS            행 수 제한
     """
-    models_env = os.getenv("OLLAMA_MODELS", os.getenv("OLLAMA_MODEL", "llama3.1:8b"))
+    models_env = os.getenv(
+        "OLLAMA_MODELS",
+        os.getenv("OLLAMA_MODEL", "llama3.1:8b,deepseek-r1:8b,gemma4:26b"),
+    )
     model_names = [m.strip() for m in models_env.split(",") if m.strip()]
     default_model = model_names[0]
 

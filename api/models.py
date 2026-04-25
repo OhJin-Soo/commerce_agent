@@ -14,7 +14,7 @@ class QueryRequest(BaseModel):
     )
     model: str = Field(
         "llama3.1:8b",
-        description="사용할 Ollama 모델 이름 (예: 'llama3.1:8b', 'deepseek-r1:8b').",
+        description="사용할 Ollama 모델 이름 (예: 'llama3.1:8b', 'deepseek-r1:8b', 'gemma4:26b').",
     )
 
 
