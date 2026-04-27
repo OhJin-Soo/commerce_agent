@@ -12,14 +12,20 @@ from tests.eval.compare import (
     ModelCompareSummary,
     PathMetrics,
     PathResult,
+    _classify_error_status,
+    _extract_search_web_queries,
+    _extract_tool_args,
     _compute_metrics,
     _extract_react_csv,
     _extract_tool_sequence,
     _was_ingest_unnecessary,
     run_compare_eval,
     run_model_compare_eval,
+    run_path_eval,
 )
-from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics
+from tests.eval.model_report import compare_summary_to_records, react_web_search_summary_to_records
+from tests.eval.react_web_search_runner import ReactWebSearchCaseResult, ReactWebSearchEvalSummary
+from tests.eval.metrics import category_hit, grounding_rate, tool_sequence_metrics, web_grounding_rate
 from tests.eval.react_golden_set import REACT_GOLDEN_SET, ReactGoldenCase
 
 
@@ -64,6 +70,13 @@ class TestGroundingRate:
         assert grounding_rate(response, rows) == pytest.approx(1.0)
 
 
+class TestWebGroundingRate:
+    def test_title_overlap_counts_as_grounded(self):
+        results = [{"title": "Sony WH-1000XM5 리뷰", "url": "https://example.com/review"}]
+        response = "Sony WH-1000XM5는 착용감과 노이즈 캔슬링 평가가 좋습니다."
+        assert web_grounding_rate(response, results) == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
 # category_hit
 # ---------------------------------------------------------------------------
@@ -97,14 +110,14 @@ class TestToolSequenceMetrics:
         assert m["tool_recall"]    == pytest.approx(1.0)
         assert m["tool_precision"] == pytest.approx(1.0)
 
-    def test_with_optional_ingest(self):
-        """optional 인 ingest_data 를 포함해도 precision 이 1.0 이어야 한다."""
+    def test_unexpected_ingest_penalized(self):
+        """요청 경로에서 ingest_data 를 호출하면 precision 이 낮아져야 한다."""
         required = ["search_category", "check_db_loaded", "query_products"]
-        optional = ["ingest_data"]
+        optional = []
         actual   = ["search_category", "check_db_loaded", "ingest_data", "query_products"]
         m = tool_sequence_metrics(required, optional, actual)
         assert m["tool_recall"]    == pytest.approx(1.0)
-        assert m["tool_precision"] == pytest.approx(1.0)
+        assert m["tool_precision"] == pytest.approx(3 / 4)
 
     def test_missing_required(self):
         """query_products 를 빠뜨리면 recall < 1."""
@@ -167,6 +180,22 @@ class TestExtractToolSequence:
         assert _extract_tool_sequence([]) == []
 
 
+class TestExtractToolArgs:
+    def test_extracts_last_tool_args_from_ai_message(self):
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "query_products", "args": {"csv_filename": "Headphones.csv", "limit": 10}, "id": "1", "type": "tool_call"},
+        ])
+        assert _extract_tool_args([ai], "query_products") == {"csv_filename": "Headphones.csv", "limit": 10}
+
+
+class TestExtractSearchWebQueries:
+    def test_extracts_search_web_queries(self):
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "search_web", "args": {"query": "Sony WH-1000XM5 리뷰"}, "id": "1", "type": "tool_call"},
+        ])
+        assert _extract_search_web_queries([ai]) == ["Sony WH-1000XM5 리뷰"]
+
+
 class TestExtractReactCsv:
     def test_extracts_csv_from_search_category(self):
         msgs = [
@@ -213,6 +242,14 @@ class TestWasIngestUnnecessary:
         assert _was_ingest_unnecessary([]) is False
 
 
+class TestClassifyErrorStatus:
+    def test_tool_unsupported(self):
+        assert _classify_error_status("model does not support tools", []) == "tool_unsupported"
+
+    def test_infra_failure(self):
+        assert _classify_error_status("TAVILY_API_KEY missing", []) == "infra_failure"
+
+
 # ---------------------------------------------------------------------------
 # _compute_metrics
 # ---------------------------------------------------------------------------
@@ -223,8 +260,9 @@ class TestComputeMetrics:
             query="이어폰 5만원 이하",
             csv_filename="Headphones.csv",
             required_tools=["search_category", "check_db_loaded", "query_products"],
-            optional_tools=["ingest_data"],
+            optional_tools=[],
             reference_sql="SELECT 1",
+            expected_query_products_args={"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10},
         )
 
     def test_pipeline_category_hit(self):
@@ -252,6 +290,34 @@ class TestComputeMetrics:
         )
         m = _compute_metrics(result, [], self._case(), is_react=True)
         assert m.tool_recall == pytest.approx(2 / 3)
+
+    def test_react_tool_argument_accuracy(self):
+        ai = AIMessage(content="", tool_calls=[
+            {"name": "query_products", "args": {"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10}, "id": "1", "type": "tool_call"},
+        ])
+        result = PathResult(
+            csv_filename="Headphones.csv",
+            response="",
+            sql_rows=[],
+            tool_sequence=["search_category", "check_db_loaded", "query_products"],
+            react_messages=[ai],
+            tool_arguments={"query_products": {"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10}},
+        )
+        m = _compute_metrics(result, [], self._case(), is_react=True)
+        assert m.tool_argument_accuracy == pytest.approx(1.0)
+
+    def test_react_error_status_flags(self):
+        result = PathResult(
+            csv_filename=None,
+            response="",
+            sql_rows=[],
+            error_status="tool_unsupported",
+            tool_sequence=[],
+            react_messages=[],
+        )
+        m = _compute_metrics(result, [], self._case(), is_react=True)
+        assert m.tool_unsupported is True
+        assert m.infra_failure is False
 
     def test_react_unnecessary_ingest_detected(self):
         msgs = [
@@ -355,6 +421,55 @@ class TestRunCompareEval:
         assert summary.react.avg_llm_calls == pytest.approx(4.0)
         assert summary.pipeline.avg_llm_calls == pytest.approx(1.0)
 
+    async def test_pipeline_llm_calls_include_query_plan(self):
+        graph = _make_graph(
+            pipeline_state={
+                "sql_rows": [],
+                "response": "",
+                "csv_filename": "Headphones.csv",
+                "query_plan": {"csv_filename": "Headphones.csv"},
+                "query_plan_llm_calls": 1,
+                "response_llm_calls": 1,
+            },
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Headphones.csv", True),
+                "react_iterations": 1,
+            },
+        )
+        summary = await run_compare_eval(graph, REACT_GOLDEN_SET[:1], session_factory=None)
+        assert summary.pipeline.avg_llm_calls == pytest.approx(2.0)
+
+    async def test_tokens_and_cost_are_aggregated(self):
+        graph = _make_graph(
+            pipeline_state={
+                "sql_rows": [],
+                "response": "",
+                "csv_filename": "Headphones.csv",
+                "response_llm_calls": 1,
+                "llm_input_tokens": 100,
+                "llm_output_tokens": 50,
+                "llm_total_tokens": 150,
+            },
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Headphones.csv", True),
+                "react_iterations": 1,
+                "llm_input_tokens": 20,
+                "llm_output_tokens": 10,
+                "llm_total_tokens": 30,
+            },
+        )
+        summary = await run_compare_eval(
+            graph,
+            REACT_GOLDEN_SET[:1],
+            session_factory=None,
+            input_cost_per_1k=0.1,
+            output_cost_per_1k=0.2,
+        )
+        assert summary.pipeline.avg_total_tokens == pytest.approx(150.0)
+        assert summary.pipeline.total_estimated_cost == pytest.approx(0.02)
+
     async def test_tool_recall_all_required(self):
         """required 3개 도구를 모두 호출하면 tool_recall=1.0."""
         graph = _make_graph(
@@ -422,6 +537,72 @@ class TestRunCompareEval:
         assert "avg_llm_calls"         in out
         assert "tool_recall"           in out
         assert "unnecessary_ingest"    in out
+
+    async def test_run_path_eval_pipeline_only(self):
+        graph = _make_graph(
+            pipeline_state={"sql_rows": [], "response": "", "csv_filename": "Headphones.csv"},
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Speakers.csv", True),
+                "react_iterations": 3,
+            },
+        )
+        summary = await run_path_eval(
+            graph,
+            REACT_GOLDEN_SET[:1],
+            use_react=False,
+            session_factory=None,
+        )
+        assert summary.pipeline.category_hit_rate == pytest.approx(1.0)
+        assert summary.react.category_hit_rate == pytest.approx(0.0)
+
+    async def test_react_report_hides_search_web_metrics(self):
+        graph = _make_graph(
+            pipeline_state={"sql_rows": [], "response": "", "csv_filename": "Headphones.csv"},
+            react_state={
+                "sql_rows": [], "response": "",
+                "react_messages": _make_tool_msgs("Headphones.csv", True),
+                "react_iterations": 3,
+            },
+        )
+        summary = await run_compare_eval(graph, REACT_GOLDEN_SET[:1], session_factory=None)
+        run, cases = compare_summary_to_records(summary, "react")
+        assert "search_web_recall" not in run
+        assert "search_web_grounding_rate" not in run
+        assert "search_web_recall" not in cases[0]
+        assert "search_web_grounding_rate" not in cases[0]
+
+
+class TestReactWebSearchReport:
+    def test_dedicated_report_exposes_search_web_metrics(self):
+        summary = ReactWebSearchEvalSummary(
+            model_name="test-model",
+            n=1,
+            search_web_recall=1.0,
+            search_success_rate=1.0,
+            avg_source_count=2.0,
+            grounding_rate=0.5,
+            avg_latency_ms=10.0,
+            p95_latency_ms=10.0,
+            avg_llm_calls=2.0,
+            avg_total_tokens=100.0,
+            tool_unsupported_rate=0.0,
+            infra_failure_rate=0.0,
+            cases=[
+                ReactWebSearchCaseResult(
+                    query="Sony WH-1000XM5 리뷰",
+                    search_web_called=True,
+                    search_query="Sony WH-1000XM5 리뷰",
+                    result_count=2,
+                    response="요약",
+                    grounding_rate=0.5,
+                )
+            ],
+        )
+        run, cases = react_web_search_summary_to_records(summary)
+        assert run["search_web_recall"] == pytest.approx(1.0)
+        assert cases[0]["search_web_called"] is True
+        assert cases[0]["result_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -496,13 +677,13 @@ class TestReactGoldenSet:
             assert "check_db_loaded" in c.required_tools,  f"{c.query}: check_db_loaded 누락"
             assert "query_products"  in c.required_tools,  f"{c.query}: query_products 누락"
 
-    def test_ingest_in_optional_not_required(self):
+    def test_ingest_not_allowed_in_request_path(self):
         for c in REACT_GOLDEN_SET:
             assert "ingest_data" not in c.required_tools, (
-                f"{c.query}: ingest_data 는 optional 이어야 합니다"
+                f"{c.query}: ingest_data 는 request path 에서 호출하면 안 됩니다"
             )
-            assert "ingest_data" in c.optional_tools, (
-                f"{c.query}: ingest_data 가 optional_tools 에 없습니다"
+            assert "ingest_data" not in c.optional_tools, (
+                f"{c.query}: ingest_data 는 optional_tools 에도 없어야 합니다"
             )
 
     def test_all_cases_have_csv_filename(self):

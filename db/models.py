@@ -5,6 +5,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    JSON,
     Numeric,
     Integer,
     Text,
@@ -122,4 +123,96 @@ class EvalCase(Base):
 
     __table_args__ = (
         Index("ix_eval_cases_run_id", "run_id"),
+    )
+
+
+class ModelEvalRun(Base):
+    """모델/경로 단위 평가 실행 결과."""
+
+    __tablename__ = "model_eval_runs"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    batch_id = Column(Text)
+    model_name = Column(Text, nullable=False)
+    eval_path = Column(Text, nullable=False)            # pipeline | react | query-plan
+    probe_count = Column(Integer, nullable=False)
+    has_db_eval = Column(Boolean, nullable=False, default=False)
+
+    category_hit_rate = Column(Float)
+    search_success_rate = Column(Float)
+    avg_source_count = Column(Float)
+    grounding_rate = Column(Float)
+    answer_faithfulness = Column(Float)
+    execution_accuracy = Column(Float)
+    result_f1 = Column(Float)
+    precision_at_5 = Column(Float)
+    ndcg_at_5 = Column(Float)
+    query_plan_accuracy = Column(Float)
+    fallback_rate = Column(Float)
+
+    avg_latency_ms = Column(Float)
+    p95_latency_ms = Column(Float)
+    avg_llm_calls = Column(Float)
+    avg_total_tokens = Column(Float)
+    total_estimated_cost = Column(Float)
+
+    tool_recall = Column(Float)
+    tool_precision = Column(Float)
+    unnecessary_ingest_rate = Column(Float)
+
+    summary_json = Column(JSON)
+
+    cases = relationship("ModelEvalCase", back_populates="run", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("ix_model_eval_runs_batch_id", "batch_id"),
+        Index("ix_model_eval_runs_model_path_created", "model_name", "eval_path", "created_at"),
+    )
+
+
+class ModelEvalCase(Base):
+    """모델 평가 실행 내 케이스별 상세 결과."""
+
+    __tablename__ = "model_eval_cases"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    run_id = Column(
+        BigInteger,
+        ForeignKey("model_eval_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    query = Column(Text, nullable=False)
+    expected_csv = Column(Text)
+    actual_csv = Column(Text)
+    response = Column(Text)
+    error_msg = Column(Text)
+
+    category_hit = Column(Boolean)
+    grounding_rate = Column(Float)
+    answer_faithfulness = Column(Float)
+    execution_accuracy = Column(Float)
+    result_f1 = Column(Float)
+    precision_at_5 = Column(Float)
+    ndcg_at_5 = Column(Float)
+    query_plan_accuracy = Column(Float)
+    used_fallback = Column(Boolean)
+
+    latency_ms = Column(Float)
+    llm_calls = Column(Integer)
+    total_tokens = Column(Integer)
+    estimated_cost = Column(Float)
+
+    tool_recall = Column(Float)
+    tool_precision = Column(Float)
+    unnecessary_ingest = Column(Boolean)
+
+    expected_plan = Column(JSON)
+    actual_plan = Column(JSON)
+    raw_json = Column(JSON)
+
+    run = relationship("ModelEvalRun", back_populates="cases")
+
+    __table_args__ = (
+        Index("ix_model_eval_cases_run_id", "run_id"),
     )

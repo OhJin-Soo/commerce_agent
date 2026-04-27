@@ -3,8 +3,8 @@
 ## 개요
 
 Kaggle 공개 데이터셋을 내부 커머스 DB로 축적하는 에이전트.
-사용자가 질문하면 로컬 DB를 먼저 조회하고, 해당 카테고리가 미적재 상태이면 Kaggle CSV → 파싱 → DB 저장 후 응답한다.
-시간이 지날수록 DB에 데이터가 쌓여 재적재 빈도가 낮아지는 구조.
+Kaggle 공개 데이터셋을 별도 preload 스크립트로 내부 커머스 DB에 미리 적재한다.
+사용자 요청 경로는 ingestion 을 수행하지 않고, 이미 적재된 로컬 DB를 조회한 뒤 응답한다.
 
 에이전트 워크플로우는 **LangGraph** `StateGraph`로 구현한다.
 
@@ -78,9 +78,11 @@ commerce_agent/
 ## 시스템 구조
 
 ```
-User Query  { "query": "...", "use_react": false|true, "model": "llama3.1:8b" }
+User Query  { "query": "..." }
     ↓
-FastAPI (POST /query)  — app.state.graphs[model] 로 그래프 선택
+FastAPI (POST /query)  — 쿼리 성격으로 운영 모델/경로 자동 선택
+    ├─ 일반 DB 조회 → llama3.1:8b + pipeline
+    └─ 리뷰/후기/평가 → gemma4:26b + ReAct
     ↓
 LangGraph CommerceGraph
     ↓
@@ -89,10 +91,9 @@ LangGraph CommerceGraph
     │                                                                               │
     │  [classify_intent] (키워드 매핑)                                              │
     │      ├─ intent=web_search → [web_search] (Tavily) → [generate_response] → END │
-    │      ├─ csv_filename 있음 → [check_loaded]                                    │
-    │      │      ├─ loaded=true  → [run_sql] → [generate_response] → END           │
-    │      │      └─ loaded=false → [run_ingestion] → [run_sql] → [generate_response] → END
-    │      └─ csv_filename 없음 ──────────────────→ [generate_response] → END       │
+    │      └─ 그 외 → [generate_query_plan] (LLM structured output, 실패 시 fallback)│
+    │              ├─ csv_filename 있음 → [check_loaded] → [run_sql] → [generate_response] → END
+    │              └─ csv_filename 없음 ───────────→ [generate_response] → END       │
     │                                                                               │
     └─ use_react=true ──────────────────────────────────────────────────────────────┘
            │
@@ -103,8 +104,8 @@ LangGraph CommerceGraph
            │ tool_calls 없음
            └──► END
 
-[run_ingestion] = IngestionPipeline(KaggleLoad → Normalize → Upsert)
-[react_act] 사용 가능 도구: search_category / check_db_loaded / ingest_data / query_products / search_web
+[preload.py] = IngestionPipeline(KaggleLoad → Normalize → Upsert)
+[react_act] 사용 가능 도구: search_category / check_db_loaded / query_products / search_web
 ```
 
 ---
@@ -120,7 +121,7 @@ LangGraph CommerceGraph
 from typing import Literal, NotRequired, TypedDict
 
 Intent = Literal["sql", "llm", "web_search"]
-#   "sql"        → check_loaded → (run_ingestion →) run_sql → generate_response
+#   "sql"        → check_loaded → run_sql → generate_response
 #   "llm"        → generate_response  (카테고리 키워드 없으면 LLM 직행)
 #   "web_search" → web_search (Tavily) → generate_response
 
@@ -137,9 +138,11 @@ class AgentState(TypedDict):
     csv_filename: NotRequired[str | None] # Kaggle CSV 파일명 (예: "Headphones.csv")
 
     # ── check_loaded가 채움 ───────────────────────────────────────────
-    data_loaded: NotRequired[bool]        # True → run_sql, False → run_ingestion
+    data_loaded: NotRequired[bool]        # 참고용. 요청 중 ingestion 은 수행하지 않음
 
-    # ── run_sql이 채움 ────────────────────────────────────────────────
+    # ── generate_query_plan / run_sql이 채움 ──────────────────────────
+    query_plan: NotRequired[dict]         # LLM structured output 기반 검색 계획
+    query_plan_error: NotRequired[str | None]
     sql_rows: NotRequired[list[dict]]
 
     # ── web_search 노드가 채움 ────────────────────────────────────────
@@ -161,10 +164,11 @@ class AgentState(TypedDict):
 | 노드 | 파일 | 역할 |
 |---|---|---|
 | `classify_intent` | `agent/nodes.py` | 키워드 매핑으로 intent/csv_filename 결정 (Phase 2에서 LLM 교체 예정) |
+| `generate_query_plan` | `agent/nodes.py` | LLM structured output으로 QueryPlan 생성. 실패 시 기존 `_build_sql()` fallback |
 | `web_search` | `agent/nodes.py` | Tavily API로 웹 검색, 결과를 `web_results`에 저장 (`web_search` 인텐트 전용) |
 | `check_loaded` | `agent/nodes.py` | source_site 기준으로 DB에 데이터 존재 여부 확인 |
-| `run_ingestion` | `agent/nodes.py` | IngestionPipeline 실행 (Kaggle CSV → DB upsert) |
-| `run_sql` | `agent/nodes.py` | 키워드 기반 SQL 생성 + 실행 (Phase 2에서 LLM SQL Agent 교체 예정) |
+| `preload.py` | 프로젝트 루트 | 요청 전 Kaggle CSV → DB upsert 를 수행하는 별도 스크립트 |
+| `run_sql` | `agent/nodes.py` | QueryPlan → SQLAlchemy select 실행. QueryPlan 없거나 실패하면 기존 규칙 기반 `_build_sql()` 실행 |
 | `generate_response` | `agent/nodes.py` | `web_results` > `sql_rows` 순 우선순위로 컨텍스트를 구성해 LLM 응답 생성 |
 
 `normalize`, `upsert`는 LangGraph 노드가 아닌 `IngestionPipeline` 내부 Filter로 처리한다.
@@ -182,7 +186,6 @@ class AgentState(TypedDict):
 |---|---|---|
 | `search_category` | 키워드 → CSV 파일명 + 카테고리 레이블 | 순수 함수, DB 없음 |
 | `check_db_loaded` | DB에 해당 source_site 데이터가 있는지 확인 | DB SELECT |
-| `ingest_data` | Kaggle CSV 내려받아 DB upsert | Kaggle + DB |
 | `query_products` | 가격·카테고리 조건으로 상품 조회 | DB SELECT |
 | `search_web` | Tavily로 웹 검색 — 리뷰·후기 등 비정형 외부 정보 수집 | Tavily API |
 
@@ -689,15 +692,19 @@ FROM eval_runs ORDER BY created_at DESC;
 tests/eval/
 ├── golden_set.py         # (query, reference_sql) 쌍 10개
 ├── react_golden_set.py   # ReactGoldenCase: golden_set + required_tools + optional_tools
+├── query_plan_golden_set.py # QueryPlan expected_plan 골든셋
 ├── metrics.py            # check_schema / EX / F1 / component_match
-│                         # + grounding_rate / category_hit / tool_sequence_metrics  ← 신규
+│                         # + QueryPlan / top-k / faithfulness / latency helper 지표
 ├── runner.py             # run_eval() → EvalSummary + DB 기록 (SQL 품질 평가)
-├── compare.py            # run_compare_eval() → CompareSummary (ReAct vs 파이프라인)  ← 신규
+├── query_plan_runner.py  # run_query_plan_eval() → QueryPlanEvalSummary
+├── compare.py            # run_compare_eval() → CompareSummary (ReAct vs 파이프라인)
 ├── test_eval_metrics.py  # metrics 단위 테스트 (DB 불필요)
 ├── test_eval_runner.py   # runner 단위 테스트 (DB mock)
-└── test_compare.py       # compare 단위 테스트 45개 (DB·LLM 불필요)  ← 신규
+├── test_query_plan_runner.py
+└── test_compare.py       # compare 단위 테스트 (DB·LLM 불필요)
 
 eval.py                   # 평가 실행 CLI 진입점
+eval_models.py            # 모델 비교 CLI + DB 저장 + JSON/CSV export
 ```
 
 **두 평가 실행기의 역할 분리:**
@@ -705,7 +712,8 @@ eval.py                   # 평가 실행 CLI 진입점
 | 실행기 | 대상 | 핵심 지표 |
 |---|---|---|
 | `run_eval()` | SQL 생성 품질 측정 | schema_invalid_rate, EX, F1, component_match |
-| `run_compare_eval()` | ReAct vs 파이프라인 비교 | category_hit, grounding_rate, tool_recall, llm_calls, latency |
+| `run_query_plan_eval()` | LLM structured QueryPlan 품질 측정 | plan_accuracy, field_accuracy, fallback_rate, llm_calls, p95_latency |
+| `run_compare_eval()` | ReAct vs 파이프라인 비교 | category_hit, grounding_rate, faithfulness, precision@5, ndcg@5, tool_recall, llm_calls, latency/token/cost |
 
 **`run_compare_eval` 측정 지표:**
 
@@ -714,9 +722,17 @@ eval.py                   # 평가 실행 CLI 진입점
 | `category_hit` | ✓ | |
 | `execution_accuracy` (EX) | ✓ (DB 필요) | |
 | `result_f1` | ✓ (DB 필요) | |
+| `precision_at_5` | ✓ (DB 필요) | |
+| `ndcg_at_5` | ✓ (DB 필요) | |
 | `grounding_rate` | ✓ | |
+| `answer_faithfulness` | ✓ | |
 | `avg_latency_ms` | ✓ | |
+| `p95_latency_ms` | ✓ | |
 | `avg_llm_calls` | ✓ | |
+| `avg_total_tokens` | ✓ | |
+| `total_estimated_cost` | ✓ | |
+| `fallback_rate` | ✓ | |
+| `query_plan_accuracy` | ✓ | |
 | `tool_recall` | | ✓ |
 | `tool_precision` | | ✓ |
 | `unnecessary_ingest_rate` | | ✓ |
@@ -730,6 +746,12 @@ eval.py                   # 평가 실행 CLI 진입점
 ```bash
 # 규칙 기반 baseline 측정
 uv run python eval.py --model rule-based-v1
+
+# 모델 비교 평가 + model_eval_runs/model_eval_cases 저장 + 리포트 export
+uv run python eval_models.py --models llama3.1:8b,gemma4:26b --path all
+uv run python eval_models.py --models llama3.1:8b,gemma4:26b --paths pipeline,query-plan
+uv run python eval_models.py --models llama3.1:8b --path react --no-db-eval
+uv run python eval_models.py --models llama3.1:8b --path query-plan
 
 # LLM 도입 후 품질 기준 체크
 uv run python eval.py --model llama3.1:8b
@@ -813,8 +835,7 @@ class NormalizedProduct(BaseModel):
 # Phase 1 — 구현 완료
 POST /query
     body: {
-        "query": "이어폰 5만원 이하",
-        "use_react": false          # true 이면 ReAct 경로, false(기본) 이면 파이프라인 경로
+        "query": "이어폰 5만원 이하"
     }
     response: {
         "response": "...",          # LLM 최종 응답
@@ -822,7 +843,8 @@ POST /query
         "category": "Headphones",   # 파이프라인 경로만 채워짐
         "sql_rows": [...],          # DB 조회 결과
         "error": null,
-        "react_steps": 3            # ReAct 경로의 도구 호출 횟수 (파이프라인은 0)
+        "react_steps": 3,           # ReAct 경로의 도구 호출 횟수 (파이프라인은 0)
+        "model": "llama3.1:8b"      # 실제 자동 선택된 모델
     }
 
 GET /rate
@@ -836,16 +858,15 @@ GET /products/{id}
     → 상품 상세 + product_facts
 ```
 
-**`use_react` 플래그 동작:**
+**API 운영 라우팅:**
 
 ```
-use_react=false (기본)         use_react=true
+일반 DB 기반 질의             리뷰/후기/평가 등 외부 정보 수요
 ─────────────────────         ────────────────────────────
-classify_intent (키워드)       react_reason (LLM 추론)
-→ check_loaded                → react_act (도구 실행)
-→ run_ingestion?              → react_reason (관찰 후 재추론)
-→ run_sql                     → ... (반복)
-→ generate_response           → 최종 답변
+llama3.1:8b                  gemma4:26b
+pipeline                     ReAct
+→ QueryPlan/DB 조회           → resolve/search/query tool 사용
+→ generate_response           → search_web 포함 가능
 ```
 
 > `POST /refresh/{id}` (강제 재적재)는 Phase 3 이후 검토. Kaggle 정적 CSV 환경에서는 TTL/freshness 개념이 없으므로 불필요하다.
@@ -1191,13 +1212,14 @@ uv run pytest -m eval                             # 프롬프트 변경 후 수�
 - [x] SQL 품질 평가 인프라 (`tests/eval/`: golden_set, metrics, runner, EvalRun/EvalCase DB 기록)
 - [x] **ReAct 경로 추가** (`agent/react_nodes.py`, `use_react` 플래그, `react_steps` 응답 필드)
 - [x] **ReAct vs 파이프라인 비교 평가** (`tests/eval/compare.py`, `react_golden_set.py`)
+- [x] **Structured QueryPlan 경로 추가** (`agent/query_plan.py`, LLM structured output, SQLAlchemy select builder, `_build_sql()` fallback)
 
 ### Phase 2 — 구조 개선
 
 > 목표: classify_intent·run_sql LLM 교체, Clean Architecture 레이어 분리, 커버리지 확대
 
-- [ ] `classify_intent` — LLM structured output으로 교체 (키워드 미매핑 케이스 대응)
-- [ ] `run_sql` — LLM SQL Agent로 교체 (Stage 2: Validator + Retry)
+- [ ] `classify_intent` — QueryPlan 기반 카테고리 해석으로 점진 통합 (키워드 미매핑 케이스 대응)
+- [ ] `run_sql` — SQL Agent는 기본 경로가 아니라 평가/비교용 경로로 추가
 - [ ] `run_compare_eval`로 ReAct vs 파이프라인 품질·비용 비교 측정 후 기본 경로 결정
 - [ ] `IProductRepository` 인터페이스 도입 + 노드 팩토리에 주입
 - [ ] `interface/`, `application/`, `domain/`, `infrastructure/` 레이어 분리

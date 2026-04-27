@@ -8,6 +8,14 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 # Run the project
 uv run python main.py
 
+# Preload Kaggle product data into DB
+uv run python preload.py
+
+# Evaluate models
+uv run python eval_models.py --models llama3.1:8b,gemma4:26b --path all
+uv run python eval_models.py --models llama3.1:8b,gemma4:26b --paths pipeline,query-plan
+uv run python eval_models.py --models llama3.1:8b --path query-plan
+
 # Add a dependency
 uv add <package>
 
@@ -22,15 +30,12 @@ uv run pytest tests/path/to/test.py::test_name
 
 **commerce-agent** is a search-augmented commerce agent that accumulates external web product data into an internal structured DB. The core loop:
 
-1. User query arrives
-2. Check local DB first
-3. On miss or stale data → web search
-4. Parse and normalize search results
-5. Upsert into DB
-6. Generate response from structured data (+ LLM for interpretation)
-7. Future queries hit DB first
+1. Product data is preloaded into the DB via `preload.py`
+2. User query arrives
+3. Check local DB
+4. Generate response from structured data (+ LLM for interpretation)
 
-The project is in early/design stage — `main.py` is a stub and no dependencies are wired yet.
+The API request path does not perform ingestion. New categories must be loaded by running the preload script explicitly.
 
 ## Intended Architecture
 
@@ -46,7 +51,7 @@ The project is in early/design stage — `main.py` is a stub and no dependencies
 
 **Query routing (Intent Router):**
 - Structured queries (`"이어폰 5만원 이하"`) → SQL Agent → PostgreSQL
-- Category not yet loaded → Kaggle CSV Ingestion → DB Upsert → SQL
+- Category not yet loaded → return DB miss / empty results; run `preload.py` separately
 - Interpretation/recommendation → LLM response generation
 
 ## Database Schema (planned)

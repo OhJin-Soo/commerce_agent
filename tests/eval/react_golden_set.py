@@ -4,11 +4,11 @@
 ReAct 전용 필드(expected_tools, optional_tools)를 추가한다.
 
 required_tools : 어떤 상황에서도 반드시 호출해야 하는 도구
-optional_tools : 상황(DB 적재 여부)에 따라 호출될 수 있는 도구
+optional_tools : 상황에 따라 호출될 수 있는 도구
 
 정상 도구 순서::
 
-    search_category → check_db_loaded → [ingest_data?] → query_products
+    search_category → check_db_loaded → query_products
 """
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ class ReactGoldenCase:
     required_tools: list[str]         # 반드시 호출해야 할 도구
     optional_tools: list[str]         # 호출해도/안 해도 되는 도구
     reference_sql: str                # EX/F1 계산용 기준 SQL
+    expected_query_products_args: dict | None = None
+    expects_search_web: bool = False
 
 
 # GOLDEN_SET 과 동일한 쿼리 순서 유지
@@ -39,112 +41,122 @@ REACT_GOLDEN_SET: list[ReactGoldenCase] = [
         query="이어폰 5만원 이하",
         csv_filename="Headphones.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE price <= 3125"
             " AND source_site = 'kaggle/amazon-products/Headphones'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Headphones.csv", "max_price_krw": 50000, "limit": 10},
     ),
     ReactGoldenCase(
         query="헤드폰 30만원 이하",
         csv_filename="Headphones.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE price <= 18750"
             " AND source_site = 'kaggle/amazon-products/Headphones'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Headphones.csv", "max_price_krw": 300000, "limit": 10},
     ),
     ReactGoldenCase(
         query="스피커 목록",
         csv_filename="Speakers.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE source_site = 'kaggle/amazon-products/Speakers'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Speakers.csv", "limit": 10},
     ),
     # ── 영상·TV ─────────────────────────────────────────────────────────────
     ReactGoldenCase(
         query="tv 50만원 이하",
         csv_filename="Televisions.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE price <= 31250"
             " AND source_site = 'kaggle/amazon-products/Televisions'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Televisions.csv", "max_price_krw": 500000, "limit": 10},
     ),
     # ── 가전 ────────────────────────────────────────────────────────────────
     ReactGoldenCase(
         query="냉장고 목록",
         csv_filename="Refrigerators.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE source_site = 'kaggle/amazon-products/Refrigerators'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Refrigerators.csv", "limit": 10},
     ),
     ReactGoldenCase(
         query="세탁기 50만원 이하",
         csv_filename="Washing Machines.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE price <= 31250"
             " AND source_site = 'kaggle/amazon-products/Washing Machines'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Washing Machines.csv", "max_price_krw": 500000, "limit": 10},
     ),
     # ── 컴퓨터 ──────────────────────────────────────────────────────────────
     ReactGoldenCase(
         query="노트북 100만원 이상",
         csv_filename="All Electronics.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE price >= 62500"
             " AND source_site = 'kaggle/amazon-products/All Electronics'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "All Electronics.csv", "min_price_krw": 1000000, "limit": 10},
     ),
     # ── 패션 ────────────────────────────────────────────────────────────────
     ReactGoldenCase(
         query="시계 10만원 이하",
         csv_filename="Watches.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE price <= 6250"
             " AND source_site = 'kaggle/amazon-products/Watches'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Watches.csv", "max_price_krw": 100000, "limit": 10},
     ),
     ReactGoldenCase(
         query="가방 목록",
         csv_filename="Bags and Luggage.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE source_site = 'kaggle/amazon-products/Bags and Luggage'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Bags and Luggage.csv", "limit": 10},
     ),
     # ── 카메라 ──────────────────────────────────────────────────────────────
     ReactGoldenCase(
         query="카메라 목록",
         csv_filename="Cameras.csv",
         required_tools=["search_category", "check_db_loaded", "query_products"],
-        optional_tools=["ingest_data"],
+        optional_tools=[],
         reference_sql=(
             f"{_BASE} WHERE source_site = 'kaggle/amazon-products/Cameras'"
             f" {_ORDER}"
         ),
+        expected_query_products_args={"csv_filename": "Cameras.csv", "limit": 10},
     ),
 ]
 

@@ -13,10 +13,19 @@ from agent import GraphDeps, build_graph
 from api.routes import router
 from db.currency import fetch_inr_to_krw
 from db.session import AsyncSessionLocal
+from observability.langsmith import configure_langsmith
 
 load_dotenv()
+configure_langsmith()
 
 logger = logging.getLogger(__name__)
+
+
+def _chat_ollama(model: str) -> ChatOllama:
+    base_url = os.getenv("OLLAMA_HOST") or None
+    if base_url:
+        return ChatOllama(model=model, base_url=base_url)
+    return ChatOllama(model=model)
 
 
 @asynccontextmanager
@@ -24,13 +33,24 @@ async def lifespan(app: FastAPI):
     """앱 시작 시 LangGraph 를 모델별로 한 번씩 빌드해 app.state 에 보관한다.
 
     환경 변수:
-        OLLAMA_MODELS   쉼표 구분 모델 목록 (기본: "llama3.1:8b")
-                        예) "llama3.1:8b,deepseek-r1:8b"
+        OLLAMA_MODELS   쉼표 구분 모델 목록
+                        기본: "llama3.1:8b,gemma4:26b"
+                        예) "llama3.1:8b,gemma4:26b"
+        PIPELINE_MODEL  일반 DB 조회용 모델. 기본: "llama3.1:8b"
+        WEB_SEARCH_MODEL  리뷰/후기 등 웹검색 수요용 모델. 기본: "gemma4:26b"
         KAGGLE_DATASET_HANDLE   Kaggle 데이터셋 핸들
         KAGGLE_NROWS            행 수 제한
     """
-    models_env = os.getenv("OLLAMA_MODELS", os.getenv("OLLAMA_MODEL", "llama3.1:8b"))
+    models_env = os.getenv(
+        "OLLAMA_MODELS",
+        os.getenv("OLLAMA_MODEL", "llama3.1:8b,gemma4:26b"),
+    )
     model_names = [m.strip() for m in models_env.split(",") if m.strip()]
+    pipeline_model = os.getenv("PIPELINE_MODEL", "llama3.1:8b")
+    web_search_model = os.getenv("WEB_SEARCH_MODEL", "gemma4:26b")
+    for routed_model in (pipeline_model, web_search_model):
+        if routed_model and routed_model not in model_names:
+            model_names.append(routed_model)
     default_model = model_names[0]
 
     ingest_handle = os.getenv(
@@ -50,7 +70,7 @@ async def lifespan(app: FastAPI):
     for model in model_names:
         deps = GraphDeps(
             session_factory=AsyncSessionLocal,
-            llm=ChatOllama(model=model),
+            llm=_chat_ollama(model),
             dataset_handle=ingest_handle,
             ingest_nrows=ingest_nrows,
             exchange_rate=exchange_rate,
@@ -61,6 +81,8 @@ async def lifespan(app: FastAPI):
 
     app.state.graphs = graphs
     app.state.default_model = default_model
+    app.state.pipeline_model = pipeline_model
+    app.state.web_search_model = web_search_model
     app.state.exchange_rate = exchange_rate
 
     yield

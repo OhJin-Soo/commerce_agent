@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.deps import get_exchange_rate
 from api.models import QueryRequest, QueryResponse
+from agent.resolve_product import needs_web_search
+from observability.langsmith import build_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,20 @@ def _resolve_graph(request: Request, model: str):
     return graph
 
 
+def _select_runtime(request: Request, query: str) -> tuple[str, bool, str]:
+    """쿼리 성격에 따라 API 운영 경로를 선택한다.
+
+    - 리뷰/후기/평가 등 외부 정보 수요: gemma + ReAct
+    - 일반 DB 기반 상품 조회: llama + pipeline
+    """
+    if needs_web_search(query):
+        model = getattr(request.app.state, "web_search_model", "gemma4:26b")
+        return model, True, "web_search_react"
+
+    model = getattr(request.app.state, "pipeline_model", "llama3.1:8b")
+    return model, False, "db_pipeline"
+
+
 @router.post(
     "/query",
     response_model=QueryResponse,
@@ -43,22 +59,36 @@ def _resolve_graph(request: Request, model: str):
         "**ReAct 경로** (`use_react=true`)\n"
         "- LLM이 Thought→Act→Observe 루프로 도구를 직접 선택·실행\n"
         "- 응답의 `react_steps` 필드에서 도구 호출 횟수 확인 가능\n\n"
-        "**모델 선택** (`model` 필드)\n"
-        "- `llama3.1:8b` (기본) 또는 `deepseek-r1:8b` 등 서버에 로드된 모델 지정"
+        "**운영 라우팅**\n"
+        "- 일반 DB 기반 조회 → `llama3.1:8b` + pipeline\n"
+        "- 리뷰/후기/평가 등 웹검색 수요 → `gemma4:26b` + ReAct\n"
+        "- 응답의 `model` 필드는 실제 선택된 모델을 반환"
     ),
 )
 async def query_endpoint(
     request: Request,
     body: QueryRequest,
 ) -> QueryResponse:
-    graph = _resolve_graph(request, body.model)
+    selected_model, selected_use_react, route_policy = _select_runtime(request, body.query)
+    graph = _resolve_graph(request, selected_model)
     logger.info(
-        "POST /query  query=%r  use_react=%s  model=%s",
-        body.query, body.use_react, body.model,
+        "POST /query  query=%r  use_react=%s  model=%s  route_policy=%s",
+        body.query, selected_use_react, selected_model, route_policy,
     )
     try:
+        run_config = build_run_config(
+            "api.query",
+            tags=["api", "query", "react" if selected_use_react else "pipeline", selected_model],
+            metadata={
+                "model": selected_model,
+                "use_react": selected_use_react,
+                "route_policy": route_policy,
+                "query_length": len(body.query),
+            },
+        )
         result: dict = await graph.ainvoke(
-            {"query": body.query, "use_react": body.use_react}
+            {"query": body.query, "use_react": selected_use_react},
+            config=run_config,
         )
     except Exception as exc:
         logger.exception("graph.ainvoke failed")
@@ -71,7 +101,7 @@ async def query_endpoint(
         sql_rows=result.get("sql_rows", []),
         error=result.get("error"),
         react_steps=result.get("react_iterations", 0),
-        model=body.model,
+        model=selected_model,
     )
 
 

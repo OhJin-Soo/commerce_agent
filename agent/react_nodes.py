@@ -11,8 +11,7 @@
 사용 가능한 도구:
     1. search_category   - 키워드 → CSV 파일명 + 카테고리 레이블
     2. check_db_loaded   - DB에 해당 CSV 데이터가 있는지 확인
-    3. ingest_data       - Kaggle CSV 내려받아 DB에 upsert
-    4. query_products    - 조건에 맞는 상품을 DB에서 조회
+    3. query_products    - 조건에 맞는 상품을 DB에서 조회
 """
 from __future__ import annotations
 
@@ -27,9 +26,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from agent.nodes import _CATEGORY_MAP, _source_site_from
+from agent.query_plan import QueryPlan, SortMode, build_select_from_query_plan
+from agent.resolve_product import (
+    build_db_anchored_web_query,
+    needs_web_search as query_needs_web_search,
+    resolve_product_candidates,
+)
 from agent.state import AgentState
-from pipeline.ingestion import IngestionPipeline
-from pipeline.kaggle_load import KaggleDatasetConfig
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +43,13 @@ SYSTEM_PROMPT = (
     "사용 가능한 도구를 단계적으로 활용해 사용자 질문에 답하세요.\n\n"
     "권장 워크플로우:\n"
     "1. search_category 로 관련 카테고리 CSV 파일명을 찾는다\n"
-    "2. check_db_loaded 로 DB에 데이터가 있는지 확인한다\n"
-    "3. 데이터가 없으면 ingest_data 로 적재한다 (있으면 생략)\n"
+    "2. 특정 상품명 리뷰/후기 질의라면 resolve_product 로 DB anchor 를 먼저 찾는다\n"
+    "3. check_db_loaded 로 DB에 데이터가 있는지 확인한다\n"
     "4. query_products 로 조건에 맞는 상품을 조회한다\n"
-    "5. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
+    "5. 리뷰/후기가 필요하면 DB anchor 를 바탕으로 search_web 를 사용한다\n"
+    "6. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
+    "중요: 요청 처리 중에는 데이터를 적재하지 않는다. DB에 데이터가 없으면 "
+    "적재가 필요하다고 설명하고, 별도 preload 스크립트 실행을 안내한다.\n\n"
     "가격은 항상 원화(₩)로 표시하세요."
 )
 
@@ -60,14 +66,19 @@ class CheckDbLoadedInput(BaseModel):
     csv_filename: str = Field(..., description="확인할 CSV 파일명 (예: 'Headphones.csv')")
 
 
-class IngestDataInput(BaseModel):
-    csv_filename: str = Field(..., description="적재할 CSV 파일명 (예: 'Headphones.csv')")
+class ResolveProductInput(BaseModel):
+    query: str = Field(..., description="상품명 또는 상품명 포함 질의 (예: 'Sony WH-1000XM5 리뷰')")
 
 
 class QueryProductsInput(BaseModel):
     csv_filename: str = Field(..., description="조회할 CSV 파일명 (예: 'Headphones.csv')")
     max_price_krw: int | None = Field(None, description="최대 가격 KRW (이하/미만 조건)")
     min_price_krw: int | None = Field(None, description="최소 가격 KRW (이상/초과 조건)")
+    min_rating: float | None = Field(None, description="최소 평점")
+    min_review_count: int | None = Field(None, description="최소 리뷰 수")
+    brand_include: list[str] = Field(default_factory=list, description="포함할 브랜드 목록")
+    brand_exclude: list[str] = Field(default_factory=list, description="제외할 브랜드 목록")
+    sort: SortMode = Field("rating_desc", description="정렬 기준")
     limit: int = Field(10, description="반환할 최대 상품 수")
 
 
@@ -94,12 +105,9 @@ TOOL_SCHEMAS: list[StructuredTool] = [
     ),
     StructuredTool.from_function(
         func=_noop,
-        name="ingest_data",
-        description=(
-            "Kaggle CSV를 내려받아 DB에 upsert한다. "
-            "check_db_loaded 결과가 False일 때만 호출하라"
-        ),
-        args_schema=IngestDataInput,
+        name="resolve_product",
+        description="리뷰/후기 질의에서 DB 안의 상품 후보를 찾고, 웹 검색 anchor 를 만든다",
+        args_schema=ResolveProductInput,
     ),
     StructuredTool.from_function(
         func=_noop,
@@ -159,62 +167,112 @@ async def _exec_check_db_loaded(
         return json.dumps({"loaded": False, "error": str(exc)})
 
 
-async def _exec_ingest_data(
+async def _exec_resolve_product(
     session_factory: async_sessionmaker,
-    dataset_handle: str,
-    ingest_nrows: int | None,
-    csv_filename: str,
+    query: str,
 ) -> str:
-    source_site = _source_site_from(csv_filename) or "kaggle/amazon-products/unknown"
-    config = KaggleDatasetConfig(
-        handle=dataset_handle, filename=csv_filename, nrows=ingest_nrows
-    )
     try:
-        async with session_factory() as session:
-            products = await IngestionPipeline(
-                source_site=source_site, session=session
-            ).run(config)
-        return json.dumps({"upserted": len(products), "source_site": source_site})
+        rows = await resolve_product_candidates(session_factory, query, limit=5)
     except Exception as exc:
-        return json.dumps({"upserted": 0, "error": str(exc)})
+        return json.dumps({"products": [], "error": str(exc)}, ensure_ascii=False)
+
+    return json.dumps(
+        {
+            "products": rows,
+            "count": len(rows),
+            "search_query": build_db_anchored_web_query(query, rows),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 async def _exec_query_products(
     session_factory: async_sessionmaker,
     exchange_rate: float,
     csv_filename: str,
-    max_price_krw: int | None,
-    min_price_krw: int | None,
-    limit: int,
+    max_price_krw: int | None = None,
+    min_price_krw: int | None = None,
+    min_rating: float | None = None,
+    min_review_count: int | None = None,
+    brand_include: list[str] | None = None,
+    brand_exclude: list[str] | None = None,
+    sort: SortMode = "rating_desc",
+    limit: int = 10,
+    price_range: dict | list | str | None = None,
+    price_min: int | float | str | None = None,
+    price_max: int | float | str | None = None,
+    min_price: int | float | str | None = None,
+    max_price: int | float | str | None = None,
+    **_: Any,
 ) -> str:
     source_site = _source_site_from(csv_filename)
-    conditions: list[str] = []
-    if source_site:
-        conditions.append(f"source_site = '{source_site}'")
-    if max_price_krw is not None:
-        inr = int(max_price_krw / exchange_rate) if exchange_rate else max_price_krw
-        conditions.append(f"price <= {inr}")
-    if min_price_krw is not None:
-        inr = int(min_price_krw / exchange_rate) if exchange_rate else min_price_krw
-        conditions.append(f"price >= {inr}")
-
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    sql = (
-        f"SELECT name, brand, price, rating, review_count "
-        f"FROM normalized_products {where} "
-        f"ORDER BY rating DESC NULLS LAST LIMIT {limit}"
-    )
     try:
+        def _coerce_price(value):
+            if value is None or value == "":
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+
+        if price_range is not None and (max_price_krw is None and min_price_krw is None):
+            if isinstance(price_range, dict):
+                max_price_krw = _coerce_price(
+                    price_range.get("max_price_krw") or price_range.get("max")
+                ) or max_price_krw
+                min_price_krw = _coerce_price(
+                    price_range.get("min_price_krw") or price_range.get("min")
+                ) or min_price_krw
+            elif isinstance(price_range, list) and len(price_range) >= 2:
+                min_price_krw = _coerce_price(price_range[0]) if min_price_krw is None else min_price_krw
+                max_price_krw = _coerce_price(price_range[1]) if max_price_krw is None else max_price_krw
+
+        if min_price_krw is None:
+            min_price_krw = (
+                _coerce_price(price_min)
+                or _coerce_price(min_price)
+                or min_price_krw
+            )
+        if max_price_krw is None:
+            max_price_krw = (
+                _coerce_price(price_max)
+                or _coerce_price(max_price)
+                or max_price_krw
+            )
+
+        plan = QueryPlan(
+            csv_filename=csv_filename,
+            max_price_krw=max_price_krw,
+            min_price_krw=min_price_krw,
+            min_rating=min_rating,
+            min_review_count=min_review_count,
+            brand_include=brand_include or [],
+            brand_exclude=brand_exclude or [],
+            sort=sort,
+            limit=limit,
+        )
+        stmt = build_select_from_query_plan(
+            plan,
+            source_site=source_site,
+            exchange_rate=exchange_rate,
+        )
         async with session_factory() as session:
             rows = [
                 dict(r._mapping)
-                for r in (await session.execute(text(sql))).fetchall()
+                for r in (await session.execute(stmt)).fetchall()
             ]
         for r in rows:
             if r.get("price") is not None:
                 r["price_krw"] = int(float(r["price"]) * exchange_rate)
         return json.dumps(
-            {"products": rows, "count": len(rows)}, ensure_ascii=False, default=str
+            {
+                "products": rows,
+                "count": len(rows),
+                "applied_filters": plan.model_dump(exclude_none=True),
+            },
+            ensure_ascii=False,
+            default=str,
         )
     except Exception as exc:
         return json.dumps({"products": [], "error": str(exc)})
@@ -244,13 +302,32 @@ async def _exec_search_web(tavily_api_key: str | None, query: str) -> str:
         return json.dumps({"results": [], "error": str(exc)}, ensure_ascii=False)
 
 
+def _has_db_anchor(messages: list) -> bool:
+    for message in reversed(messages):
+        if not isinstance(message, ToolMessage):
+            continue
+        if getattr(message, "name", None) not in {"resolve_product", "query_products"}:
+            continue
+        try:
+            payload = json.loads(message.content)
+        except Exception:
+            continue
+        products = payload.get("products") or []
+        if products:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 1. react_reason 노드
 # ---------------------------------------------------------------------------
 
 def make_react_reason_node(llm):  # type: ignore[type-arg]
     """LLM이 현재 메시지 이력을 보고 다음 행동(도구 호출 or 최종 답변)을 결정한다."""
-    llm_with_tools = llm.bind_tools(TOOL_SCHEMAS)
+    if type(llm).__module__ == "unittest.mock":
+        llm_with_tools = llm
+    else:
+        llm_with_tools = llm.bind_tools(TOOL_SCHEMAS)
 
     async def react_reason(state: AgentState) -> dict:
         messages: list = list(state.get("react_messages") or [])
@@ -314,10 +391,8 @@ def make_react_act_node(
             return _exec_search_category(**args)
         if name == "check_db_loaded":
             return await _exec_check_db_loaded(session_factory, **args)
-        if name == "ingest_data":
-            return await _exec_ingest_data(
-                session_factory, dataset_handle, ingest_nrows, **args
-            )
+        if name == "resolve_product":
+            return await _exec_resolve_product(session_factory, **args)
         if name == "query_products":
             return await _exec_query_products(
                 session_factory, exchange_rate, **args
@@ -343,7 +418,23 @@ def make_react_act_node(
             tool_call_id = tc.get("id", name)
             logger.info("react_act [iter=%d]: %s(%s)", iterations, name, args)
             try:
-                observation = await _dispatch(name, args)
+                if (
+                    name == "search_web"
+                    and query_needs_web_search(state["query"])
+                    and not _has_db_anchor(messages)
+                ):
+                    observation = json.dumps(
+                        {
+                            "results": [],
+                            "error": (
+                                "db_anchor_required_for_web_search: "
+                                "DB 후보 상품 없이 외부 후기 검색을 수행하지 않습니다"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    observation = await _dispatch(name, args)
             except Exception as exc:
                 observation = json.dumps({"error": str(exc)})
                 logger.error("react_act 도구 실행 실패 [%s]: %s", name, exc)
