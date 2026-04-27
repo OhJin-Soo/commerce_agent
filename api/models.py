@@ -8,13 +8,15 @@ class QueryRequest(BaseModel):
     use_react: bool = Field(
         False,
         description=(
-            "True: LLM이 도구를 직접 선택하는 ReAct 경로. "
-            "False(기본): 키워드 기반 결정론적 파이프라인 경로."
+            "Legacy field. The API now routes automatically: normal DB queries use pipeline, "
+            "review/web-search queries use ReAct."
         ),
     )
     model: str = Field(
         "llama3.1:8b",
-        description="사용할 Ollama 모델 이름 (예: 'llama3.1:8b', 'gemma4:26b').",
+        description=(
+            "Legacy field. The API returns the actually selected model in the response."
+        ),
     )
 
 

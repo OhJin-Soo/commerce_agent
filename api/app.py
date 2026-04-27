@@ -29,6 +29,8 @@ async def lifespan(app: FastAPI):
         OLLAMA_MODELS   쉼표 구분 모델 목록
                         기본: "llama3.1:8b,gemma4:26b"
                         예) "llama3.1:8b,gemma4:26b"
+        PIPELINE_MODEL  일반 DB 조회용 모델. 기본: "llama3.1:8b"
+        WEB_SEARCH_MODEL  리뷰/후기 등 웹검색 수요용 모델. 기본: "gemma4:26b"
         KAGGLE_DATASET_HANDLE   Kaggle 데이터셋 핸들
         KAGGLE_NROWS            행 수 제한
     """
@@ -67,6 +69,8 @@ async def lifespan(app: FastAPI):
 
     app.state.graphs = graphs
     app.state.default_model = default_model
+    app.state.pipeline_model = os.getenv("PIPELINE_MODEL", "llama3.1:8b")
+    app.state.web_search_model = os.getenv("WEB_SEARCH_MODEL", "gemma4:26b")
     app.state.exchange_rate = exchange_rate
 
     yield

@@ -78,9 +78,11 @@ commerce_agent/
 ## 시스템 구조
 
 ```
-User Query  { "query": "...", "use_react": false|true, "model": "llama3.1:8b" }
+User Query  { "query": "..." }
     ↓
-FastAPI (POST /query)  — app.state.graphs[model] 로 그래프 선택
+FastAPI (POST /query)  — 쿼리 성격으로 운영 모델/경로 자동 선택
+    ├─ 일반 DB 조회 → llama3.1:8b + pipeline
+    └─ 리뷰/후기/평가 → gemma4:26b + ReAct
     ↓
 LangGraph CommerceGraph
     ↓
@@ -833,8 +835,7 @@ class NormalizedProduct(BaseModel):
 # Phase 1 — 구현 완료
 POST /query
     body: {
-        "query": "이어폰 5만원 이하",
-        "use_react": false          # true 이면 ReAct 경로, false(기본) 이면 파이프라인 경로
+        "query": "이어폰 5만원 이하"
     }
     response: {
         "response": "...",          # LLM 최종 응답
@@ -842,7 +843,8 @@ POST /query
         "category": "Headphones",   # 파이프라인 경로만 채워짐
         "sql_rows": [...],          # DB 조회 결과
         "error": null,
-        "react_steps": 3            # ReAct 경로의 도구 호출 횟수 (파이프라인은 0)
+        "react_steps": 3,           # ReAct 경로의 도구 호출 횟수 (파이프라인은 0)
+        "model": "llama3.1:8b"      # 실제 자동 선택된 모델
     }
 
 GET /rate
@@ -856,16 +858,15 @@ GET /products/{id}
     → 상품 상세 + product_facts
 ```
 
-**`use_react` 플래그 동작:**
+**API 운영 라우팅:**
 
 ```
-use_react=false (기본)         use_react=true
+일반 DB 기반 질의             리뷰/후기/평가 등 외부 정보 수요
 ─────────────────────         ────────────────────────────
-classify_intent (키워드)       react_reason (LLM 추론)
-→ check_loaded                → react_act (도구 실행)
-→ run_ingestion?              → react_reason (관찰 후 재추론)
-→ run_sql                     → ... (반복)
-→ generate_response           → 최종 답변
+llama3.1:8b                  gemma4:26b
+pipeline                     ReAct
+→ QueryPlan/DB 조회           → resolve/search/query tool 사용
+→ generate_response           → search_web 포함 가능
 ```
 
 > `POST /refresh/{id}` (강제 재적재)는 Phase 3 이후 검토. Kaggle 정적 CSV 환경에서는 TTL/freshness 개념이 없으므로 불필요하다.
