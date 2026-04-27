@@ -84,7 +84,12 @@ async def _build_graph(model: str):
     ingest_nrows = int(os.getenv("KAGGLE_NROWS", "50000"))
     tavily_api_key = os.getenv("TAVILY_API_KEY") or None
     exchange_rate = await fetch_inr_to_krw()
-    llm = ChatOllama(model=model)
+    ollama_host = os.getenv("OLLAMA_HOST") or None
+    llm = (
+        ChatOllama(model=model, base_url=ollama_host)
+        if ollama_host
+        else ChatOllama(model=model)
+    )
     deps = GraphDeps(
         session_factory=AsyncSessionLocal,
         llm=llm,
