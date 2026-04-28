@@ -659,6 +659,8 @@ class TestWebSearchPath:
         MockClient.assert_not_called()
         assert result["db_miss"] is True
         assert "DB" in result["response"]
+        assert "웹에서" not in result["response"]
+        assert "모델명" not in result["response"]
 
     async def test_react_search_web_tool_no_key(self):
         """search_web 도구 — API 키 없으면 빈 results 반환."""
@@ -787,12 +789,12 @@ class TestWebSearchPath:
         assert result["applied_filters"]["max_price_krw"] == 50000
 
     async def test_react_blocks_unanchored_search_web(self):
-        """ReAct 도 DB anchor 없이 search_web 단독 호출을 허용하지 않는다."""
+        """ReAct 도 DB anchor 없이 search_web 단독 호출이나 웹검색 제안을 허용하지 않는다."""
         llm = _make_react_llm(
             tool_calls_sequence=[
                 [{"name": "search_web", "id": "c1", "args": {"query": "Sony WH-1000XM5 리뷰"}}],
             ],
-            final_text="최종 답변",
+            final_text="특정 모델명을 알려주시면 웹에서 리뷰를 찾아드릴 수 있습니다.",
         )
         deps = GraphDeps(
             session_factory=_make_react_session_factory(),
@@ -808,3 +810,26 @@ class TestWebSearchPath:
         MockClient.assert_not_called()
         tool_message = result["react_messages"][3]
         assert "db_anchor_required_for_web_search" in tool_message.content
+        assert "DB에 있는 상품만 외부 리뷰 검색" in result["response"]
+        assert "웹에서 리뷰를 찾아드릴" not in result["response"]
+        assert "모델명" not in result["response"]
+
+    async def test_react_review_final_without_db_anchor_uses_policy_response(self):
+        """도구를 쓰지 않고 바로 답하더라도 DB anchor 없는 리뷰 질의는 정책 응답으로 교체한다."""
+        llm = _make_react_llm(
+            tool_calls_sequence=[],
+            final_text="특정 노트북 모델명을 알려주시면 웹상의 최신 사용자 리뷰를 찾아드릴 수 있습니다.",
+        )
+        deps = GraphDeps(
+            session_factory=_make_react_session_factory(),
+            llm=llm,
+            tavily_api_key="test-key",
+        )
+
+        result = await build_graph(deps).ainvoke(
+            {"query": "노트북 후기 알려줘", "use_react": True}
+        )
+
+        assert "DB에 있는 상품만 외부 리뷰 검색" in result["response"]
+        assert "웹상의 최신 사용자 리뷰" not in result["response"]
+        assert "모델명" not in result["response"]

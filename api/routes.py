@@ -55,7 +55,7 @@ def _select_runtime(request: Request, query: str) -> tuple[str, bool, str]:
         "**파이프라인 경로** (`use_react=false`, 기본)\n"
         "- 구조적 질문(`이어폰 5만원 이하`) → DB SQL 조회\n"
         "- 추천·해석 질문(`이어폰 추천해줘`) → LLM 응답\n"
-        "- 데이터 미적재 시 Kaggle 자동 인제스트 후 SQL 조회\n\n"
+        "- 데이터 미적재 시 API 요청 중 인제스트하지 않으며, 별도 `preload.py` 실행 필요\n\n"
         "**ReAct 경로** (`use_react=true`)\n"
         "- LLM이 Thought→Act→Observe 루프로 도구를 직접 선택·실행\n"
         "- 응답의 `react_steps` 필드에서 도구 호출 횟수 확인 가능\n\n"

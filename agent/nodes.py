@@ -440,7 +440,7 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
 
     - sql_rows 가 있으면 DB 상품 데이터를 컨텍스트로 사용한다.
     - web_results 가 있으면 Tavily 검색 결과를 컨텍스트로 사용한다.
-    - 둘 다 없으면 LLM 자체 지식으로 답변한다.
+    - 둘 다 없으면 내부 DB에 관련 데이터가 없다고 답한다.
 
     DB 가격(INR)을 exchange_rate 로 곱해 KRW 로 변환한다.
     """
@@ -450,7 +450,10 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
         "You are a Korean commerce assistant. "
         "IMPORTANT: You MUST respond ONLY in Korean (한국어). "
         "Do NOT use any other language. Every word must be Korean. "
-        "Answer concisely based on the product data. "
+        "Answer only from the provided DB product data and web search context. "
+        "Web search context is allowed only when it is anchored to a DB product. "
+        "If there is no product data, say the product/category is not available in the internal DB. "
+        "Never suggest that the user provide another model name so you can search the web for DB-missing products. "
         "Always express prices in Korean Won (₩)."
     )
 
@@ -505,7 +508,8 @@ def make_generate_response_node(llm, exchange_rate: float = 1.0) -> NodeFn:  # t
             return {
                 "response": (
                     "현재 내부 상품 DB에서 해당 상품이나 후보 상품을 찾지 못했습니다. "
-                    "이 경로에서는 DB에 없는 상품의 후기만 단독으로 제공하지 않습니다."
+                    "DB에 있는 상품만 외부 리뷰 검색을 수행하므로, DB에 없는 상품의 후기만 "
+                    "단독으로 제공하지 않습니다."
                 ),
                 "response_llm_calls": 0,
                 "llm_input_tokens": 0,
