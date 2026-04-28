@@ -49,8 +49,17 @@ SYSTEM_PROMPT = (
     "5. 리뷰/후기가 필요하면 DB anchor 를 바탕으로 search_web 를 사용한다\n"
     "6. 결과를 바탕으로 최종 답변을 한국어로 작성한다\n\n"
     "중요: 요청 처리 중에는 데이터를 적재하지 않는다. DB에 데이터가 없으면 "
-    "적재가 필요하다고 설명하고, 별도 preload 스크립트 실행을 안내한다.\n\n"
+    "내부 DB에서 해당 상품이나 후보 상품을 찾지 못했다고만 설명한다.\n\n"
+    "중요: 외부 웹 검색은 내부 DB에서 찾은 상품 후보가 있을 때만 허용된다. "
+    "DB에 없는 상품명이나 카테고리에 대해 '모델명을 알려주면 웹에서 리뷰를 찾아주겠다'고 "
+    "제안하지 않는다. DB에 없는 상품의 후기는 제공하지 않는다.\n\n"
     "가격은 항상 원화(₩)로 표시하세요."
+)
+
+DB_ANCHOR_REQUIRED_RESPONSE = (
+    "현재 내부 상품 DB에서 해당 상품이나 후보 상품을 찾지 못했습니다. "
+    "DB에 있는 상품만 외부 리뷰 검색을 수행하므로, DB에 없는 상품의 후기만 "
+    "단독으로 제공하지 않습니다."
 )
 
 
@@ -120,7 +129,8 @@ TOOL_SCHEMAS: list[StructuredTool] = [
         name="search_web",
         description=(
             "Tavily 로 웹을 검색해 상품 리뷰·후기·평가 등 비정형 외부 정보를 수집한다. "
-            "DB에 없는 사용자 의견이나 최신 정보가 필요할 때 사용하라"
+            "반드시 resolve_product 또는 query_products 로 DB 상품 후보를 먼저 확보한 뒤 사용한다. "
+            "DB 상품 후보가 없으면 사용하지 않는다"
         ),
         args_schema=SearchWebInput,
     ),
@@ -368,6 +378,11 @@ def make_react_reason_node(llm):  # type: ignore[type-arg]
         # 도구 호출 없음 → 최종 답변
         logger.info("react_reason [iter=%d]: 최종 답변 생성", iterations)
         from agent.utils import strip_thinking
+        if query_needs_web_search(state["query"]) and not _has_db_anchor(messages):
+            return {
+                "react_messages": messages,
+                "response": DB_ANCHOR_REQUIRED_RESPONSE,
+            }
         return {"react_messages": messages, "response": strip_thinking(ai_msg.content)}
 
     return react_reason
